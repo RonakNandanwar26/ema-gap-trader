@@ -47,6 +47,8 @@ class Trader:
         self._last_exit_idx = -999
         self._tick_manager: TickManager | None = None
         self._last_df: pd.DataFrame | None = None  # cached candle DF for virtual close
+        self._daily_pnl: float = 0.0
+        self._daily_limit_hit: bool = False
 
     # ------------------------------------------------------------------
     # Main loop
@@ -134,6 +136,19 @@ class Trader:
             if self.open_trade is not None:
                 candles_held = candle_count - self.open_trade.get("candle_num", 0)
                 reason = check_exit(row, self.open_trade["dir"], candles_held, self.sc.max_hold_candles)
+
+                # Premium-based stop loss check (candle-level fallback)
+                if reason is None and self.sc.stop_loss_pct > 0:
+                    opt_ltp = None
+                    if self._tick_manager:
+                        opt_ltp = self._tick_manager.get_ltp(self.open_trade["token"])
+                    if opt_ltp is None:
+                        opt_ltp = broker.fetch_ltp(self.ic.nfo_exchange, self.open_trade["symbol"], self.open_trade["token"])
+                    if opt_ltp is not None and self.open_trade["entry_price"] is not None:
+                        drop_pct = (self.open_trade["entry_price"] - opt_ltp) / self.open_trade["entry_price"] * 100
+                        if drop_pct >= self.sc.stop_loss_pct:
+                            reason = "stop_loss"
+
                 if reason:
                     logger.info("EXIT SIGNAL (candle): %s after %d candles", reason, candles_held)
                     self._process_exit(reason, row)
@@ -153,7 +168,7 @@ class Trader:
                         )
 
             # Entry check
-            if self.open_trade is None and prev is not None:
+            if self.open_trade is None and prev is not None and not self._daily_limit_hit:
                 direction = check_entry(
                     row, prev, self.sc.extra_entry_mode, self.sc.ema_gap_min,
                     self._last_exit_idx, candle_count, self.sc.cooldown_candles,
@@ -293,6 +308,22 @@ class Trader:
 
         if pnl is not None:
             self.current_equity += pnl
+            self._daily_pnl += pnl
+            # Check daily loss limit
+            if (self.sc.daily_loss_limit_pct > 0
+                    and not self._daily_limit_hit
+                    and self._daily_pnl <= -(self.sc.daily_loss_limit_pct / 100 * self.initial_capital)):
+                self._daily_limit_hit = True
+                logger.warning(
+                    "DAILY LOSS LIMIT hit: daily P&L = Rs.%.0f (limit = Rs.%.0f)",
+                    self._daily_pnl, -(self.sc.daily_loss_limit_pct / 100 * self.initial_capital),
+                )
+                send_telegram(
+                    f"DAILY LOSS LIMIT HIT\n"
+                    f"Daily P&L: Rs.{self._daily_pnl:,.0f}\n"
+                    f"Limit: {self.sc.daily_loss_limit_pct}% of Rs.{self.initial_capital:,.0f}\n"
+                    f"No more entries today."
+                )
 
         # Unsubscribe option token
         if self._tick_manager:
@@ -302,11 +333,12 @@ class Trader:
         self.open_trade = None
         self._last_exit_idx = trade.get("candle_num", 0)
 
+        pnl_str = f"Rs.{pnl:,.0f}" if pnl is not None else "N/A"
         msg = (
             f"EXIT {'LIVE' if self.live else 'PAPER'} — {reason}\n"
             f"{trade['dir']} {trade['symbol']}\n"
             f"Entry: Rs.{trade['entry_price']:.1f} → Exit: Rs.{exit_premium:.1f if exit_premium else 0}\n"
-            f"P&L: Rs.{pnl:,.0f}" if pnl else "P&L: N/A"
+            f"P&L: {pnl_str}"
         )
         send_telegram(msg)
         logger.info(msg.replace("\n", " | "))
@@ -375,6 +407,19 @@ class Trader:
 
             if self.open_trade is None:
                 break  # already exited
+
+            # Premium-based stop loss check (real-time via WebSocket)
+            if self.sc.stop_loss_pct > 0:
+                opt_ltp = self._tick_manager.get_ltp(self.open_trade["token"])
+                if opt_ltp is not None and self.open_trade["entry_price"] is not None:
+                    drop_pct = (self.open_trade["entry_price"] - opt_ltp) / self.open_trade["entry_price"] * 100
+                    if drop_pct >= self.sc.stop_loss_pct:
+                        logger.info(
+                            "STOP LOSS triggered (WS): premium %.1f -> %.1f (%.1f%% drop)",
+                            self.open_trade["entry_price"], opt_ltp, drop_pct,
+                        )
+                        self._process_exit("stop_loss", None)
+                        return
 
             reason = self._check_virtual_exit(candle_count)
             if reason:

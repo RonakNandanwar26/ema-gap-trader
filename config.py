@@ -22,6 +22,8 @@ class StrategyConfig:
     max_hold_candles: int
     cooldown_candles: int
     candle_interval: int  # 5 or 15
+    stop_loss_pct: float  # per-trade SL as % premium drop (e.g. 20.0); 0 = disabled
+    daily_loss_limit_pct: float  # stop entries when daily loss hits this % of capital; 0 = disabled
 
 
 @dataclass
@@ -80,6 +82,8 @@ def get_strategy_config() -> StrategyConfig:
         max_hold_candles=int(os.getenv("MAX_HOLD_CANDLES", "20")),
         cooldown_candles=int(os.getenv("COOLDOWN_CANDLES", "3")),
         candle_interval=int(os.getenv("CANDLE_INTERVAL", "15")),
+        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "20.0")),
+        daily_loss_limit_pct=float(os.getenv("DAILY_LOSS_LIMIT_PCT", "5.0")),
     )
 
 

@@ -18,6 +18,8 @@ import streamlit as st
 from log_setup import setup_logging
 setup_logging()
 
+import plotly.io as pio
+
 from backtester import run_backtest
 from config import StrategyConfig, InstrumentConfig, INSTRUMENTS, get_dhan_db_path
 from results import compute_stats, compute_equity_curve
@@ -104,6 +106,195 @@ class TradingSession:
 
 
 # ---------------------------------------------------------------------------
+# HTML report generation
+# ---------------------------------------------------------------------------
+
+
+def _generate_html_report(stats: dict, curve: list, trades: list, sc: StrategyConfig, ic: InstrumentConfig, capital: float, start_date, end_date) -> str:
+    """Generate a standalone HTML report matching the Streamlit dashboard design."""
+
+    # Build equity chart as embedded HTML
+    chart_html = ""
+    if len(curve) > 1:
+        curve_df = pd.DataFrame(curve[1:], columns=["timestamp", "equity"])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve_df["timestamp"], y=curve_df["equity"],
+                                  mode="lines", fill="tozeroy", name="Equity",
+                                  line=dict(color="#4CAF50")))
+        fig.update_layout(title="Equity Curve", xaxis_title="Date", yaxis_title="Equity (Rs.)",
+                          height=400, template="plotly_dark",
+                          paper_bgcolor="#1a1a2e", plot_bgcolor="#16213e",
+                          font=dict(color="#e0e0e0"))
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
+
+    # Helper to build table HTML
+    def table(headers, rows):
+        h = "".join(f"<th>{h}</th>" for h in headers)
+        body = ""
+        for row in rows:
+            cells = "".join(f"<td>{c}</td>" for c in row)
+            body += f"<tr>{cells}</tr>\n"
+        return f"<table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table>"
+
+    # Entry type breakdown
+    et_table = ""
+    if stats.get("entry_type_breakdown"):
+        rows = []
+        for et, d in sorted(stats["entry_type_breakdown"].items()):
+            wr = d["w"] / d["n"] * 100 if d["n"] else 0
+            rows.append([et, d["n"], f"{wr:.0f}%", f"Rs.{d['pnl']:,.0f}"])
+        et_table = f"<h2>Entry Type Breakdown</h2>{table(['Type', 'Trades', 'WR', 'P&L'], rows)}"
+
+    # Exit breakdown
+    exit_rows = []
+    for reason, d in sorted(stats["exit_breakdown"].items()):
+        wr = d["w"] / d["n"] * 100 if d["n"] else 0
+        exit_rows.append([reason, d["n"], f"{wr:.0f}%", f"Rs.{d['pnl']:,.0f}"])
+    exit_table = table(["Reason", "Trades", "WR", "P&L"], exit_rows)
+
+    # Yearly
+    yr_rows = []
+    for y, d in sorted(stats["yearly"].items()):
+        wr = d["w"] / d["n"] * 100 if d["n"] else 0
+        yr_rows.append([y, d["n"], f"{wr:.0f}%", f"Rs.{d['pnl']:,.0f}"])
+    yr_table = table(["Year", "Trades", "WR", "P&L"], yr_rows)
+
+    # Monthly
+    mo_rows = []
+    for m, v in sorted(stats["monthly"].items()):
+        color = "#4CAF50" if v >= 0 else "#f44336"
+        mo_rows.append([m, f"<span style='color:{color}'>Rs.{v:,.0f}</span>"])
+    mo_table = table(["Month", "P&L"], mo_rows)
+
+    # Direction
+    dir_html = ""
+    if stats.get("direction"):
+        dir_rows = []
+        for d_name in ("CE", "PE"):
+            if d_name in stats["direction"]:
+                d = stats["direction"][d_name]
+                wr = d["w"] / d["n"] * 100 if d["n"] else 0
+                dir_rows.append([d_name, d["n"], f"{wr:.0f}%", f"Rs.{d['pnl']:,.0f}"])
+        if dir_rows:
+            dir_html = f"<h2>Direction Breakdown</h2>{table(['Dir', 'Trades', 'WR', 'P&L'], dir_rows)}"
+
+    # Trade log
+    trade_rows = []
+    for t in trades:
+        if t.get("prem_pnl") is not None:
+            pnl_color = "#4CAF50" if t["prem_pnl"] >= 0 else "#f44336"
+            trade_rows.append([
+                str(t.get("entry", ""))[:19],
+                str(t.get("exit", ""))[:19],
+                t.get("dir", ""),
+                f"{t.get('spot_in', 0):.1f}" if t.get("spot_in") else "",
+                f"{t.get('strike', 0):.0f}" if t.get("strike") else "",
+                f"{t.get('prem_in', 0):.1f}" if t.get("prem_in") else "",
+                f"{t.get('prem_out', 0):.1f}" if t.get("prem_out") else "",
+                f"<span style='color:{pnl_color}'>Rs.{t['prem_pnl']:,.0f}</span>",
+                t.get("reason", ""),
+                t.get("entry_type", ""),
+            ])
+    trade_table = table(
+        ["Entry", "Exit", "Dir", "Spot In", "Strike", "Prem In", "Prem Out", "P&L", "Reason", "Entry Type"],
+        trade_rows,
+    )
+
+    # Config summary
+    sl_text = f"{sc.stop_loss_pct}%" if sc.stop_loss_pct > 0 else "Disabled"
+    daily_text = f"{sc.daily_loss_limit_pct}%" if sc.daily_loss_limit_pct > 0 else "Disabled"
+
+    pnl_color = "#4CAF50" if stats["pnl"] >= 0 else "#f44336"
+    ret_color = "#4CAF50" if stats["return_pct"] >= 0 else "#f44336"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EMA Gap Trader — Backtest Report</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0e1117; color: #e0e0e0; padding: 24px; }}
+  .container {{ max-width: 1200px; margin: 0 auto; }}
+  h1 {{ color: #fff; margin-bottom: 8px; font-size: 28px; }}
+  .subtitle {{ color: #888; margin-bottom: 24px; font-size: 14px; }}
+  h2 {{ color: #ccc; margin: 32px 0 12px; font-size: 20px; border-bottom: 1px solid #333; padding-bottom: 8px; }}
+  .config {{ background: #1a1a2e; border-radius: 8px; padding: 16px; margin-bottom: 24px; display: flex; flex-wrap: wrap; gap: 24px; }}
+  .config-item {{ font-size: 13px; }}
+  .config-item .label {{ color: #888; }}
+  .config-item .value {{ color: #fff; font-weight: 600; }}
+  .metrics {{ display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 24px; }}
+  .metric {{ background: #1a1a2e; border-radius: 8px; padding: 16px; text-align: center; }}
+  .metric .label {{ font-size: 12px; color: #888; text-transform: uppercase; margin-bottom: 4px; }}
+  .metric .value {{ font-size: 22px; font-weight: 700; color: #fff; }}
+  .chart {{ margin: 24px 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 8px; font-size: 13px; }}
+  th {{ background: #1a1a2e; color: #aaa; text-align: left; padding: 10px 12px; font-weight: 600; text-transform: uppercase; font-size: 11px; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #222; }}
+  tr:hover {{ background: #1a1a2e; }}
+  .section {{ margin-bottom: 32px; }}
+  @media (max-width: 768px) {{
+    .metrics {{ grid-template-columns: repeat(3, 1fr); }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>EMA Gap Trader — Backtest Report</h1>
+  <p class="subtitle">{ic.name} | {start_date} to {end_date} | Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+
+  <div class="config">
+    <div class="config-item"><span class="label">Mode:</span> <span class="value">crossover + {sc.extra_entry_mode}</span></div>
+    <div class="config-item"><span class="label">Gap Min:</span> <span class="value">{sc.ema_gap_min}%</span></div>
+    <div class="config-item"><span class="label">Max Hold:</span> <span class="value">{sc.max_hold_candles} candles</span></div>
+    <div class="config-item"><span class="label">Cooldown:</span> <span class="value">{sc.cooldown_candles} candles</span></div>
+    <div class="config-item"><span class="label">Interval:</span> <span class="value">{sc.candle_interval}min</span></div>
+    <div class="config-item"><span class="label">Capital:</span> <span class="value">Rs.{capital:,.0f}</span></div>
+    <div class="config-item"><span class="label">Stop Loss:</span> <span class="value">{sl_text}</span></div>
+    <div class="config-item"><span class="label">Daily Limit:</span> <span class="value">{daily_text}</span></div>
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="label">Trades</div><div class="value">{stats['n']}</div></div>
+    <div class="metric"><div class="label">Win Rate</div><div class="value">{stats['wr']:.0f}%</div></div>
+    <div class="metric"><div class="label">Net P&L</div><div class="value" style="color:{pnl_color}">Rs.{stats['pnl']:,.0f}</div></div>
+    <div class="metric"><div class="label">Profit Factor</div><div class="value">{stats['pf']:.2f}</div></div>
+    <div class="metric"><div class="label">Max Drawdown</div><div class="value" style="color:#f44336">Rs.{stats['max_dd']:,.0f}</div></div>
+    <div class="metric"><div class="label">Return</div><div class="value" style="color:{ret_color}">{stats['return_pct']:.1f}%</div></div>
+  </div>
+
+  <div class="chart">{chart_html}</div>
+
+  {et_table}
+
+  <div class="section">
+    <h2>Exit Breakdown</h2>
+    {exit_table}
+  </div>
+
+  {dir_html}
+
+  <div class="section">
+    <h2>Yearly Summary</h2>
+    {yr_table}
+  </div>
+
+  <div class="section">
+    <h2>Monthly P&L</h2>
+    {mo_table}
+  </div>
+
+  <div class="section">
+    <h2>Trade Log ({len(trades)} trades)</h2>
+    {trade_table}
+  </div>
+</div>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # Session state init
 # ---------------------------------------------------------------------------
 
@@ -133,6 +324,12 @@ with st.sidebar:
     candle_interval = st.selectbox("Candle Interval (min)", [15, 5])
     capital = st.number_input("Capital (Rs.)", min_value=10000, max_value=10000000, value=100000, step=10000)
 
+    st.markdown("**Risk Management**")
+    stop_loss_pct = st.number_input("Stop Loss %", min_value=0.0, max_value=50.0, value=20.0, step=1.0,
+                                     help="Exit trade if option premium drops this % from entry. 0 = disabled.")
+    daily_loss_limit = st.number_input("Daily Loss Limit %", min_value=0.0, max_value=20.0, value=5.0, step=0.5,
+                                        help="Stop trading for the day if losses reach this % of capital. 0 = disabled.")
+
     st.markdown("---")
     # Status indicators
     paper_active = [name for name, s in st.session_state.paper_sessions.items() if s.is_running]
@@ -144,7 +341,9 @@ with st.sidebar:
 
 sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     max_hold_candles=max_hold, cooldown_candles=cooldown,
-                    candle_interval=candle_interval)
+                    candle_interval=candle_interval,
+                    stop_loss_pct=stop_loss_pct,
+                    daily_loss_limit_pct=daily_loss_limit)
 ic = INSTRUMENTS[instrument]
 
 # ---------------------------------------------------------------------------
@@ -170,6 +369,7 @@ with tab_bt:
             trades = run_backtest(
                 strat_config=sc, inst_config=ic,
                 start_date=str(start_date), end_date=str(end_date),
+                capital=capital,
             )
             stats = compute_stats(trades, capital)
             curve = compute_equity_curve(trades, capital)
@@ -240,6 +440,17 @@ with tab_bt:
                     display_cols = ["entry", "exit", "dir", "spot_in", "strike", "prem_in", "prem_out", "prem_pnl", "reason", "entry_type", "entry_gap"]
                     available = [c for c in display_cols if c in trade_df.columns]
                     st.dataframe(trade_df[available], use_container_width=True, hide_index=True)
+
+            # Download report
+            st.markdown("---")
+            html_report = _generate_html_report(stats, curve, r["trades"], sc, ic, capital, start_date, end_date)
+            filename = f"backtest_{ic.name}_{start_date}_{end_date}.html"
+            st.download_button(
+                label="Download Report (HTML)",
+                data=html_report,
+                file_name=filename,
+                mime="text/html",
+            )
 
 
 # ---------------------------------------------------------------------------
