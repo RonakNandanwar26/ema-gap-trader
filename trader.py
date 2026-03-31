@@ -10,12 +10,13 @@ import pandas as pd
 
 import broker
 from config import (
-    MARKET_CLOSE, MARKET_OPEN, TIME_EXIT, TRADING_START,
+    MARKET_CLOSE, MARKET_OPEN, TRADING_START,
     WS_ENABLED, WS_EXIT_CHECK_INTERVAL,
     StrategyConfig, InstrumentConfig, get_instrument_config, get_strategy_config, get_capital,
 )
 from indicators import compute_indicators
 from notifications import send_telegram
+from persistence import TradeStore
 from strategy import check_entry, check_exit
 from tick_manager import TickManager, EXCHANGE_NSE_CM, EXCHANGE_NSE_FO, EXCHANGE_BSE_FO
 
@@ -31,12 +32,14 @@ class Trader:
         inst_config: InstrumentConfig | None = None,
         capital: int | None = None,
         live: bool = False,
+        trade_store: TradeStore | None = None,
     ):
         self.sc = strat_config or get_strategy_config()
         self.ic = inst_config or get_instrument_config()
         self.initial_capital = capital or get_capital()
         self.current_equity = float(self.initial_capital)
         self.live = live
+        self._store = trade_store
 
         self.open_trade: dict | None = None
         self.trades: list[dict] = []
@@ -65,6 +68,28 @@ class Trader:
         today = date.today()
         self._current_expiry = broker.get_current_expiry(self._scrip_master, self.ic.name, today)
         logger.info("Expiry resolved: %s", self._current_expiry)
+
+        # Recovery: restore state from previous session
+        if self._store:
+            saved_equity = self._store.load_equity()
+            if saved_equity is not None:
+                self.current_equity = saved_equity
+                logger.info("Restored equity from previous session: %.0f", saved_equity)
+            # Load historical trades for continuity
+            self.trades = self._store.load_trades()
+            recovered = self._store.load_open_trade()
+            if recovered:
+                self._handle_recovery(recovered, today)
+
+        # Early holiday/weekend detection using 1-min candle
+        self._wait_until(time(9, 17))
+        if not self.running:
+            return
+        if not self._is_market_open_today(today):
+            logger.info("Market closed today (%s) — holiday/weekend. Stopping.", today)
+            send_telegram(f"Market closed today ({today}) — holiday/weekend. Trader stopped.")
+            self.running = False
+            return
 
         # Start WebSocket if enabled
         if WS_ENABLED:
@@ -98,11 +123,6 @@ class Trader:
             if now.time() >= MARKET_CLOSE:
                 break
 
-            # Force close at TIME_EXIT
-            if now.time() >= TIME_EXIT and self.open_trade is not None:
-                self._process_exit("time_exit", None)
-                continue
-
             if now.time() < TRADING_START:
                 time_mod.sleep(10)
                 continue
@@ -113,6 +133,13 @@ class Trader:
                 logger.debug("Not enough candles yet (%d), waiting...", len(df) if df is not None else 0)
                 time_mod.sleep(30)
                 continue
+
+            # Safety net: verify candles are from today
+            latest_ts = pd.Timestamp(df.iloc[-1]["timestamp"])
+            if latest_ts.date() < today:
+                logger.info("No candles from today — market likely closed. Stopping.")
+                send_telegram(f"No fresh candles for {today}. Market appears closed. Stopping.")
+                break
 
             df = compute_indicators(df)
             self._last_df = df  # cache for virtual close checks
@@ -165,9 +192,16 @@ class Trader:
             # Sleep until next candle — with real-time exit monitoring
             self._sleep_with_exit_monitoring(candle_count)
 
-        # End of day
+        # End of day — carry forward open position
         if self.open_trade is not None:
-            self._process_exit("market_close", None)
+            logger.info("Market close — carrying forward open position: %s %s",
+                        self.open_trade["dir"], self.open_trade.get("symbol"))
+            send_telegram(
+                f"CARRY FORWARD\n"
+                f"{self.open_trade['dir']} {self.open_trade.get('symbol', '')}\n"
+                f"Entry: Rs.{self.open_trade.get('entry_price', 0):.1f}\n"
+                f"Position will resume next trading day."
+            )
 
         # Cleanup WebSocket
         if self._tick_manager:
@@ -189,30 +223,45 @@ class Trader:
         spot = float(row["close"])
         strike_interval = self.ic.strike_interval
         atm_strike = round(spot / strike_interval) * strike_interval
-
-        # Resolve option contract
-        try:
-            symbol, token = broker.resolve_option(
-                self._scrip_master, self.ic.name, atm_strike, direction, self._current_expiry,
-            )
-        except ValueError as e:
-            logger.warning("Could not resolve option: %s", e)
-            return
-
-        # Get premium
-        premium = broker.fetch_ltp(self.ic.nfo_exchange, symbol, token)
-        if premium is None or premium <= 0:
-            logger.warning("No LTP for %s, skipping entry", symbol)
-            return
-
         qty = self.ic.lot_size
+        max_spend = self.current_equity * self.sc.max_capital_per_trade_pct
+
+        # Try ATM, then ATM+1, ATM+2 to find affordable strike
+        symbol, token, premium, strike = None, None, None, atm_strike
+        for step in range(3):  # 0=ATM, 1=ATM+1, 2=ATM+2
+            try:
+                symbol, token = broker.resolve_option(
+                    self._scrip_master, self.ic.name, strike, direction, self._current_expiry,
+                )
+            except ValueError:
+                logger.warning("Could not resolve option at strike %d", strike)
+                break
+            premium = broker.fetch_ltp(self.ic.nfo_exchange, symbol, token)
+            if premium is None or premium <= 0:
+                logger.warning("No LTP for strike %d, stopping search", strike)
+                premium = None
+                break
+            if premium * qty <= max_spend:
+                break  # affordable
+            logger.info("Strike %d premium Rs.%.1f × %d = Rs.%.0f exceeds budget Rs.%.0f, trying OTM",
+                        strike, premium, qty, premium * qty, max_spend)
+            strike += strike_interval if direction == "CE" else -strike_interval
+            symbol, token, premium = None, None, None
+
+        if premium is None or premium * qty > max_spend:
+            logger.warning("No affordable strike (ATM to ATM+2), skipping. Budget=Rs.%.0f", max_spend)
+            send_telegram(f"SKIP {direction}: no affordable strike within budget Rs.{max_spend:,.0f}")
+            return
+
+        if strike != atm_strike:
+            logger.info("Moved to OTM strike %d (ATM was %d) to fit budget", strike, atm_strike)
 
         # Live: place real order
         if self.live:
             order_id = broker.place_order({
                 "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": token,
                 "transactiontype": "BUY", "exchange": self.ic.nfo_exchange,
-                "ordertype": "MARKET", "producttype": "INTRADAY", "duration": "DAY",
+                "ordertype": "MARKET", "producttype": "CARRYFORWARD", "duration": "DAY",
                 "quantity": str(qty), "price": "0", "squareoff": "0", "stoploss": "0",
             })
             if order_id is None:
@@ -224,20 +273,28 @@ class Trader:
 
         self.open_trade = {
             "dir": direction, "entry_time": datetime.now(), "entry_price": premium,
-            "spot_entry": spot, "strike": atm_strike, "quantity": qty,
+            "spot_entry": spot, "strike": strike, "quantity": qty,
             "symbol": symbol, "token": token, "candle_num": candle_num,
             "rsi": row.get("rsi"), "gap": row.get("ema_gap_pct"),
         }
+
+        # Persist open trade to disk
+        if self._store:
+            self._store.save_open_trade(
+                {**self.open_trade, "expiry": self._current_expiry},
+                self.current_equity,
+            )
 
         # Subscribe to option token for real-time premium tracking
         if self._tick_manager:
             opt_exchange = EXCHANGE_BSE_FO if self.ic.nfo_exchange == "BFO" else EXCHANGE_NSE_FO
             self._tick_manager.subscribe(token, opt_exchange)
 
+        otm_note = f" (OTM from ATM {atm_strike})" if strike != atm_strike else ""
         msg = (
             f"ENTRY {'LIVE' if self.live else 'PAPER'}\n"
-            f"{direction} {symbol} @ Rs.{premium:.1f}\n"
-            f"Spot: {spot:.1f} | Strike: {atm_strike}\n"
+            f"{direction} {symbol} @ Rs.{premium:.1f}{otm_note}\n"
+            f"Spot: {spot:.1f} | Strike: {strike} | Cost: Rs.{premium * qty:,.0f}\n"
             f"RSI: {row.get('rsi', 0):.1f} | Gap: {row.get('ema_gap_pct', 0):.3f}%"
         )
         send_telegram(msg)
@@ -266,7 +323,7 @@ class Trader:
                 "variety": "NORMAL", "tradingsymbol": trade["symbol"],
                 "symboltoken": trade["token"], "transactiontype": "SELL",
                 "exchange": self.ic.nfo_exchange, "ordertype": "MARKET",
-                "producttype": "INTRADAY", "duration": "DAY",
+                "producttype": "CARRYFORWARD", "duration": "DAY",
                 "quantity": str(trade["quantity"]), "price": "0",
                 "squareoff": "0", "stoploss": "0",
             })
@@ -293,6 +350,12 @@ class Trader:
 
         if pnl is not None:
             self.current_equity += pnl
+
+        # Persist trade and clear open position
+        if self._store:
+            self._store.append_trade(completed)
+            self._store.clear_open_trade()
+            self._store.save_equity(self.current_equity)
 
         # Unsubscribe option token
         if self._tick_manager:
@@ -368,11 +431,6 @@ class Trader:
 
         # Poll for exit every WS_EXIT_CHECK_INTERVAL seconds
         while datetime.now() < target and self.running:
-            # Time exit check
-            if datetime.now().time() >= TIME_EXIT:
-                self._process_exit("time_exit", None)
-                return
-
             if self.open_trade is None:
                 break  # already exited
 
@@ -401,6 +459,20 @@ class Trader:
             logger.exception("Candle fetch failed")
             return None
 
+    def _is_market_open_today(self, today: date) -> bool:
+        """Fetch a 1-minute candle to check if the market is open today."""
+        from_date = today.strftime("%Y-%m-%d")
+        to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+        try:
+            df = broker.fetch_candles(self.ic.token, self.ic.exchange, 1, from_date, to_date)
+            if df is None or df.empty:
+                return False
+            latest = pd.Timestamp(df.iloc[-1]["timestamp"]).date()
+            return latest == today
+        except Exception:
+            logger.exception("Market open check failed")
+            return False
+
     # ------------------------------------------------------------------
     # Timing helpers
     # ------------------------------------------------------------------
@@ -411,3 +483,72 @@ class Trader:
             if now >= target:
                 return
             time_mod.sleep(2)  # short sleep so stop() is responsive
+
+    # ------------------------------------------------------------------
+    # Recovery from previous session
+    # ------------------------------------------------------------------
+
+    def _handle_recovery(self, recovered: dict, today: date) -> None:
+        """Handle an open trade found from a previous crashed/stopped session."""
+        expiry = recovered.get("expiry")
+        symbol = recovered.get("symbol", "?")
+        direction = recovered.get("dir", "?")
+
+        logger.info("RECOVERY: found open trade — %s %s (expiry=%s)", direction, symbol, expiry)
+        send_telegram(
+            f"RECOVERY: open trade from previous session\n"
+            f"{direction} {symbol}\n"
+            f"Entry: Rs.{recovered.get('entry_price', 0):.1f}\n"
+            f"Attempting recovery..."
+        )
+
+        # Scenario 1: contract has expired
+        if expiry and expiry < today:
+            logger.warning("Contract expired (%s < %s) — closing with loss", expiry, today)
+            pnl = -(recovered.get("entry_price", 0) * recovered.get("quantity", 0))
+            completed = {
+                "entry": recovered.get("entry_time", datetime.now()),
+                "exit": datetime.now(),
+                "dir": direction,
+                "spot_in": recovered.get("spot_entry"),
+                "spot_out": None,
+                "strike": recovered.get("strike"),
+                "prem_in": recovered.get("entry_price"),
+                "prem_out": 0,
+                "prem_pnl": pnl,
+                "reason": "recovery_expired",
+                "entry_rsi": recovered.get("rsi"),
+                "entry_gap": recovered.get("gap"),
+                "entry_type": "live",
+            }
+            self.trades.append(completed)
+            self.current_equity += pnl
+            if self._store:
+                self._store.append_trade(completed)
+                self._store.clear_open_trade()
+                self._store.save_equity(self.current_equity)
+            send_telegram(
+                f"RECOVERY CLOSED (expired)\n{direction} {symbol}\nP&L: Rs.{pnl:,.0f}"
+            )
+            return
+
+        # Scenario 2 & 3: contract still valid — resume monitoring
+        self.open_trade = {
+            "dir": direction,
+            "entry_time": recovered.get("entry_time", datetime.now()),
+            "entry_price": recovered.get("entry_price"),
+            "spot_entry": recovered.get("spot_entry"),
+            "strike": recovered.get("strike"),
+            "quantity": recovered.get("quantity"),
+            "symbol": symbol,
+            "token": recovered.get("token"),
+            "candle_num": recovered.get("candle_num", 0),
+            "rsi": recovered.get("rsi"),
+            "gap": recovered.get("gap"),
+        }
+        logger.info("RECOVERY: position restored — will manage in normal loop")
+        send_telegram(
+            f"RECOVERY: position restored\n"
+            f"{direction} {symbol} @ Rs.{recovered.get('entry_price', 0):.1f}\n"
+            f"Will monitor for exit conditions."
+        )

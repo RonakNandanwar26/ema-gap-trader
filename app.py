@@ -21,7 +21,8 @@ setup_logging()
 import plotly.io as pio
 
 from backtester import run_backtest
-from config import StrategyConfig, InstrumentConfig, INSTRUMENTS, get_dhan_db_path
+from config import StrategyConfig, InstrumentConfig, INSTRUMENTS, get_dhan_db_path, get_data_dir
+from persistence import TradeStore
 from results import compute_stats, compute_equity_curve
 from trader import Trader
 
@@ -53,6 +54,7 @@ class TradingSession:
         self.ic = inst_config
         self.capital = capital
         self.live = live
+        self._store = TradeStore(inst_config.name, "live" if live else "paper", get_data_dir())
         self._trader: Trader | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -70,7 +72,7 @@ class TradingSession:
             return
         self._error = None
         self._user_stopped = False
-        self._trader = Trader(self.sc, self.ic, self.capital, live=self.live)
+        self._trader = Trader(self.sc, self.ic, self.capital, live=self.live, trade_store=self._store)
         self._thread = threading.Thread(target=self._run, daemon=True, name="trader-thread")
         self._thread.start()
 
@@ -83,9 +85,19 @@ class TradingSession:
     def get_status(self) -> TradingStatus:
         with self._lock:
             if self._trader is None:
-                return TradingStatus(is_running=self.is_running, current_equity=float(self.capital),
-                                     initial_capital=float(self.capital), trade_count=0,
-                                     open_trade=None, error=self._error)
+                # No active trader — show historical data from store
+                historical = self._store.load_trades()
+                saved_equity = self._store.load_equity()
+                equity = saved_equity if saved_equity is not None else float(self.capital)
+                return TradingStatus(
+                    is_running=self.is_running,
+                    current_equity=equity,
+                    initial_capital=float(self.capital),
+                    trade_count=len(historical),
+                    open_trade=None,
+                    recent_trades=historical[-5:],
+                    error=self._error,
+                )
             t = self._trader
             return TradingStatus(
                 is_running=self.is_running,
@@ -316,6 +328,8 @@ with st.sidebar:
     max_hold = st.number_input("Max Hold Candles", min_value=5, max_value=50, value=20)
     cooldown = st.number_input("Cooldown Candles", min_value=1, max_value=10, value=3)
     candle_interval = st.selectbox("Candle Interval (min)", [15, 5])
+    max_capital_pct = st.slider("Max Capital Per Trade %", min_value=5, max_value=50, value=25, step=5,
+                                help="Max % of equity to spend on a single trade. Moves to OTM strike if ATM exceeds budget.")
     capital = st.number_input("Capital (Rs.)", min_value=10000, max_value=10000000, value=100000, step=10000)
 
     st.markdown("---")
@@ -329,7 +343,8 @@ with st.sidebar:
 
 sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     max_hold_candles=max_hold, cooldown_candles=cooldown,
-                    candle_interval=candle_interval)
+                    candle_interval=candle_interval,
+                    max_capital_per_trade_pct=max_capital_pct / 100)
 ic = INSTRUMENTS[instrument]
 
 # ---------------------------------------------------------------------------
@@ -442,10 +457,29 @@ with tab_bt:
 # Tab 2: Paper Trading
 # ---------------------------------------------------------------------------
 
-def _render_trading_panel(session: TradingSession | None, label: str) -> None:
+def _render_trading_panel(session: TradingSession | None, label: str, store: TradeStore | None = None) -> None:
     """Render metrics and trade log for a running or completed session."""
     if session is None:
-        st.info(f"No {label} session running.")
+        # Show historical data from store even when no session is running
+        if store:
+            historical = store.load_trades()
+            saved_equity = store.load_equity()
+            if historical:
+                st.subheader("Historical Trades")
+                m1, m2 = st.columns(2)
+                m1.metric("Past Trades", len(historical))
+                if saved_equity is not None:
+                    m2.metric("Last Equity", f"Rs.{saved_equity:,.0f}")
+                with st.expander(f"Trade History ({len(historical)} trades)"):
+                    trade_df = pd.DataFrame(historical)
+                    if not trade_df.empty:
+                        display_cols = ["entry", "exit", "dir", "strike", "prem_in", "prem_out", "prem_pnl", "reason"]
+                        available = [c for c in display_cols if c in trade_df.columns]
+                        st.dataframe(trade_df[available], use_container_width=True, hide_index=True)
+            else:
+                st.info(f"No {label} session running.")
+        else:
+            st.info(f"No {label} session running.")
         return
 
     status = session.get_status()
@@ -468,6 +502,17 @@ def _render_trading_panel(session: TradingSession | None, label: str) -> None:
     if status.recent_trades:
         st.subheader("Recent Trades")
         st.dataframe(pd.DataFrame(status.recent_trades), use_container_width=True, hide_index=True)
+
+    # All-time trade history from store
+    if store:
+        all_trades = store.load_trades()
+        if len(all_trades) > len(status.recent_trades):
+            with st.expander(f"All-Time History ({len(all_trades)} trades)"):
+                trade_df = pd.DataFrame(all_trades)
+                if not trade_df.empty:
+                    display_cols = ["entry", "exit", "dir", "strike", "prem_in", "prem_out", "prem_pnl", "reason"]
+                    available = [c for c in display_cols if c in trade_df.columns]
+                    st.dataframe(trade_df[available], use_container_width=True, hide_index=True)
 
 
 with tab_paper:
@@ -498,8 +543,20 @@ with tab_paper:
     for inst_name in ALL_INSTRUMENTS:
         inst_ic = INSTRUMENTS[inst_name]
         session = st.session_state.paper_sessions.get(inst_name)
+        paper_store = TradeStore(inst_name, "paper", get_data_dir())
 
         with st.expander(f"{inst_name} (Lot: {inst_ic.lot_size})", expanded=session is not None and session.is_running):
+            # Recovery warning
+            if session is None or not session.is_running:
+                open_trade = paper_store.load_open_trade()
+                if open_trade:
+                    st.warning(
+                        f"Unclosed position from previous session: "
+                        f"{open_trade.get('dir')} {open_trade.get('symbol', '?')} "
+                        f"@ Rs.{open_trade.get('entry_price', 0):.1f}. "
+                        f"Start the session to auto-recover."
+                    )
+
             col1, col2 = st.columns([3, 1])
             with col2:
                 if st.button(f"Start {inst_name}", key=f"start_paper_{inst_name}"):
@@ -512,7 +569,7 @@ with tab_paper:
                         session.stop()
                         st.rerun()
             with col1:
-                _render_trading_panel(session, f"paper {inst_name}")
+                _render_trading_panel(session, f"paper {inst_name}", store=paper_store)
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +621,20 @@ with tab_live:
         for inst_name in ALL_INSTRUMENTS:
             inst_ic = INSTRUMENTS[inst_name]
             session = st.session_state.live_sessions.get(inst_name)
+            live_store = TradeStore(inst_name, "live", get_data_dir())
 
             with st.expander(f"{inst_name} (Lot: {inst_ic.lot_size})", expanded=session is not None and session.is_running):
+                # Recovery warning
+                if session is None or not session.is_running:
+                    open_trade = live_store.load_open_trade()
+                    if open_trade:
+                        st.error(
+                            f"UNCLOSED LIVE POSITION from previous session: "
+                            f"{open_trade.get('dir')} {open_trade.get('symbol', '?')} "
+                            f"@ Rs.{open_trade.get('entry_price', 0):.1f}. "
+                            f"Start the session IMMEDIATELY to auto-recover!"
+                        )
+
                 col1, col2 = st.columns([3, 1])
                 with col2:
                     if st.button(f"Start {inst_name}", key=f"start_live_{inst_name}"):
@@ -578,7 +647,7 @@ with tab_live:
                             session.stop()
                             st.rerun()
                 with col1:
-                    _render_trading_panel(session, f"live {inst_name}")
+                    _render_trading_panel(session, f"live {inst_name}", store=live_store)
 
 # ---------------------------------------------------------------------------
 # Auto-refresh while trading

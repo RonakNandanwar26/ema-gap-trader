@@ -22,6 +22,7 @@ class StrategyConfig:
     max_hold_candles: int
     cooldown_candles: int
     candle_interval: int  # 5 or 15
+    max_capital_per_trade_pct: float  # e.g. 0.25 = 25% of equity
 
 
 @dataclass
@@ -45,7 +46,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     ),
     "BANKNIFTY": InstrumentConfig(
         name="BANKNIFTY", token="99926009", exchange="NSE", nfo_exchange="NFO",
-        lot_size=15, strike_interval=100, expiry_weekday=3,
+        lot_size=30, strike_interval=100, expiry_weekday=1,
         expiry_type="monthly", expiry_flag="MONTH",
     ),
     "SENSEX": InstrumentConfig(
@@ -60,7 +61,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
 # ---------------------------------------------------------------------------
 
 MARKET_OPEN = time(9, 15)
-TRADING_START = time(9, 30)
+TRADING_START = time(9, 17)
 TIME_EXIT = time(15, 10)
 MARKET_CLOSE = time(15, 30)
 
@@ -80,6 +81,7 @@ def get_strategy_config() -> StrategyConfig:
         max_hold_candles=int(os.getenv("MAX_HOLD_CANDLES", "20")),
         cooldown_candles=int(os.getenv("COOLDOWN_CANDLES", "3")),
         candle_interval=int(os.getenv("CANDLE_INTERVAL", "15")),
+        max_capital_per_trade_pct=float(os.getenv("MAX_CAPITAL_PER_TRADE_PCT", "0.25")),
     )
 
 
@@ -96,6 +98,10 @@ def get_capital() -> int:
 
 def get_dhan_db_path() -> str:
     return os.getenv("DHAN_DB_PATH", "dhan_option_cache.db")
+
+
+def get_data_dir() -> str:
+    return os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 
 
 def get_backtest_dates() -> tuple[str, str]:
