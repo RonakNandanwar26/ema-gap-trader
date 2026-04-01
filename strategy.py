@@ -17,6 +17,8 @@ def check_entry(
     last_exit_idx: int,
     current_idx: int,
     cooldown: int,
+    orb_high: float | None = None,
+    orb_low: float | None = None,
 ) -> str | None:
     """Return direction ("CE"/"PE") if entry conditions met, else None.
 
@@ -64,6 +66,13 @@ def check_entry(
     # EMA gap maximum — overextended entries (e.g. gap-and-crap) lose consistently
     if row["ema_gap_pct"] > 0.5:
         return None
+
+    # ORB direction filter — only enter if price broke the opening range
+    if orb_high is not None and orb_low is not None:
+        if direction == "CE" and row["close"] < orb_high:
+            return None
+        if direction == "PE" and row["close"] > orb_low:
+            return None
 
     return direction
 

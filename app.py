@@ -330,6 +330,8 @@ with st.sidebar:
     candle_interval = st.selectbox("Candle Interval (min)", [15, 5])
     max_capital_pct = st.slider("Max Capital Per Trade %", min_value=5, max_value=50, value=25, step=5,
                                 help="Max % of equity to spend on a single trade. Moves to OTM strike if ATM exceeds budget.")
+    orb_filter = st.checkbox("ORB Filter", value=True,
+                             help="Only enter CE above opening range high, PE below opening range low (first 30 min).")
     capital = st.number_input("Capital (Rs.)", min_value=10000, max_value=10000000, value=100000, step=10000)
 
     st.markdown("---")
@@ -344,7 +346,8 @@ with st.sidebar:
 sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     max_hold_candles=max_hold, cooldown_candles=cooldown,
                     candle_interval=candle_interval,
-                    max_capital_per_trade_pct=max_capital_pct / 100)
+                    max_capital_per_trade_pct=max_capital_pct / 100,
+                    orb_filter=orb_filter)
 ic = INSTRUMENTS[instrument]
 
 # ---------------------------------------------------------------------------

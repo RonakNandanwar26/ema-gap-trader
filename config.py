@@ -23,6 +23,7 @@ class StrategyConfig:
     cooldown_candles: int
     candle_interval: int  # 5 or 15
     max_capital_per_trade_pct: float  # e.g. 0.25 = 25% of equity
+    orb_filter: bool  # require price to break ORB range before entry
 
 
 @dataclass
@@ -82,6 +83,7 @@ def get_strategy_config() -> StrategyConfig:
         cooldown_candles=int(os.getenv("COOLDOWN_CANDLES", "3")),
         candle_interval=int(os.getenv("CANDLE_INTERVAL", "15")),
         max_capital_per_trade_pct=float(os.getenv("MAX_CAPITAL_PER_TRADE_PCT", "0.25")),
+        orb_filter=os.getenv("ORB_FILTER", "true").lower() == "true",
     )
 
 

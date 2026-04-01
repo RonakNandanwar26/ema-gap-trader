@@ -49,6 +49,8 @@ class Trader:
         self._current_expiry: date | None = None
         self._last_exit_idx = -999
         self._ws_exited_this_candle = False
+        self._orb_high: float | None = None
+        self._orb_low: float | None = None
         self._tick_manager: TickManager | None = None
         self._last_df: pd.DataFrame | None = None  # cached candle DF for virtual close
 
@@ -149,6 +151,15 @@ class Trader:
             prev = df.iloc[idx - 1] if idx > 0 else None
             candle_count += 1
 
+            # Compute ORB range from first 30 min of today
+            if self.sc.orb_filter and self._orb_high is None:
+                today_df = df[df["timestamp"].dt.date == today]
+                first_30 = today_df[today_df["timestamp"].dt.time <= time(9, 30)]
+                if len(first_30) >= 2:
+                    self._orb_high = float(first_30["high"].max())
+                    self._orb_low = float(first_30["low"].min())
+                    logger.info("ORB range set: high=%.1f low=%.1f", self._orb_high, self._orb_low)
+
             # Log candle state
             logger.info(
                 "Candle #%d | %s | Close=%.1f | EMA9=%.1f EMA21=%.1f | Gap=%.3f%% | ST=%d | RSI=%.1f",
@@ -185,6 +196,7 @@ class Trader:
                 direction = check_entry(
                     row, prev, self.sc.extra_entry_mode, self.sc.ema_gap_min,
                     self._last_exit_idx, candle_count, self.sc.cooldown_candles,
+                    self._orb_high, self._orb_low,
                 )
                 if direction:
                     logger.info("ENTRY SIGNAL: %s | Gap=%.3f%% | RSI=%.1f", direction, row["ema_gap_pct"], row["rsi"] if not pd.isna(row["rsi"]) else 0)
