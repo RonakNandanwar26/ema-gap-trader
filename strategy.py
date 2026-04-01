@@ -61,6 +61,10 @@ def check_entry(
     if gap_min > 0 and row["ema_gap_pct"] < gap_min:
         return None
 
+    # EMA gap maximum — overextended entries (e.g. gap-and-crap) lose consistently
+    if row["ema_gap_pct"] > 0.5:
+        return None
+
     return direction
 
 
