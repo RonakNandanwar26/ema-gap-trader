@@ -48,6 +48,7 @@ class Trader:
         self._scrip_master: dict | None = None
         self._current_expiry: date | None = None
         self._last_exit_idx = -999
+        self._ws_exited_this_candle = False
         self._tick_manager: TickManager | None = None
         self._last_df: pd.DataFrame | None = None  # cached candle DF for virtual close
 
@@ -191,6 +192,10 @@ class Trader:
 
             # Sleep until next candle — with real-time exit monitoring
             self._sleep_with_exit_monitoring(candle_count)
+
+            if self._ws_exited_this_candle:
+                self._ws_exited_this_candle = False
+                continue
 
         # End of day — carry forward open position
         if self.open_trade is not None:
@@ -415,9 +420,10 @@ class Trader:
     def _sleep_with_exit_monitoring(self, candle_count: int) -> None:
         """Sleep until next candle boundary, checking exits every N seconds via WebSocket."""
         now = datetime.now()
-        # Next 5-minute boundary + 15s buffer
+        # Next candle boundary + 15s buffer
+        interval = self.sc.candle_interval
         minute = now.minute
-        next_minute = ((minute // 5) + 1) * 5
+        next_minute = ((minute // interval) + 1) * interval
         if next_minute >= 60:
             target = now.replace(hour=now.hour + 1, minute=0, second=15, microsecond=0)
         else:
@@ -437,6 +443,7 @@ class Trader:
             reason = self._check_virtual_exit(candle_count)
             if reason:
                 logger.info("WebSocket exit triggered mid-candle: %s", reason)
+                self._ws_exited_this_candle = True
                 # Use virtual row = None, exit will fetch LTP from cache/REST
                 self._process_exit(f"ws_{reason}", None)
                 return
@@ -453,7 +460,7 @@ class Trader:
         to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
         try:
             return broker.fetch_candles(
-                self.ic.token, self.ic.exchange, 5, from_date, to_date,
+                self.ic.token, self.ic.exchange, self.sc.candle_interval, from_date, to_date,
             )
         except Exception:
             logger.exception("Candle fetch failed")

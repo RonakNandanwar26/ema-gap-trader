@@ -81,7 +81,10 @@ def run_backtest(
     df = _load_spot_candles(conn, ic.name, sc.candle_interval)
     df = compute_indicators(df)
 
-    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    if end_ts == end_ts.normalize():  # date-only input — include full day
+        end_ts = end_ts + pd.Timedelta(hours=23, minutes=59, seconds=59)
     indices = df.index[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)].tolist()
 
     trades: list[dict] = []

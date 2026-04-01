@@ -526,6 +526,9 @@ with tab_paper:
         if st.button("Start All Paper", type="primary"):
             for inst_name in ALL_INSTRUMENTS:
                 if inst_name not in st.session_state.paper_sessions or not st.session_state.paper_sessions[inst_name].is_running:
+                    old = st.session_state.paper_sessions.get(inst_name)
+                    if old is not None:
+                        old.stop()
                     inst_ic = INSTRUMENTS[inst_name]
                     session = TradingSession(sc, inst_ic, capital, live=False)
                     session.start()
@@ -560,6 +563,9 @@ with tab_paper:
             col1, col2 = st.columns([3, 1])
             with col2:
                 if st.button(f"Start {inst_name}", key=f"start_paper_{inst_name}"):
+                    old = st.session_state.paper_sessions.get(inst_name)
+                    if old is not None:
+                        old.stop()
                     s = TradingSession(sc, inst_ic, capital, live=False)
                     s.start()
                     st.session_state.paper_sessions[inst_name] = s
@@ -598,6 +604,9 @@ with tab_live:
             if st.button("Start All Live", type="primary"):
                 for inst_name in ALL_INSTRUMENTS:
                     if inst_name not in st.session_state.live_sessions or not st.session_state.live_sessions[inst_name].is_running:
+                        old = st.session_state.live_sessions.get(inst_name)
+                        if old is not None:
+                            old.stop()
                         inst_ic = INSTRUMENTS[inst_name]
                         session = TradingSession(sc, inst_ic, capital, live=True)
                         session.start()
@@ -638,6 +647,9 @@ with tab_live:
                 col1, col2 = st.columns([3, 1])
                 with col2:
                     if st.button(f"Start {inst_name}", key=f"start_live_{inst_name}"):
+                        old = st.session_state.live_sessions.get(inst_name)
+                        if old is not None:
+                            old.stop()
                         s = TradingSession(sc, inst_ic, capital, live=True)
                         s.start()
                         st.session_state.live_sessions[inst_name] = s
