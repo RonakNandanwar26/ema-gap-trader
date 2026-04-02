@@ -196,7 +196,7 @@ class Trader:
                 direction = check_entry(
                     row, prev, self.sc.extra_entry_mode, self.sc.ema_gap_min,
                     self._last_exit_idx, candle_count, self.sc.cooldown_candles,
-                    self._orb_high, self._orb_low,
+                    self._orb_high, self._orb_low, self.sc.orb_filter,
                 )
                 if direction:
                     logger.info("ENTRY SIGNAL: %s | Gap=%.3f%% | RSI=%.1f", direction, row["ema_gap_pct"], row["rsi"] if not pd.isna(row["rsi"]) else 0)

@@ -148,8 +148,10 @@ def run_backtest(
             continue
 
         orb = orb_ranges.get(ts.date())
-        orb_h, orb_l = orb if orb else (None, None)
-        direction = check_entry(row, prev, sc.extra_entry_mode, sc.ema_gap_min, last_exit_idx, i, sc.cooldown_candles, orb_h, orb_l)
+        # Don't pass ORB for candles within the opening range itself
+        from datetime import time as _t2
+        orb_h, orb_l = orb if (orb and ts.time() > _t2(9, 30)) else (None, None)
+        direction = check_entry(row, prev, sc.extra_entry_mode, sc.ema_gap_min, last_exit_idx, i, sc.cooldown_candles, orb_h, orb_l, sc.orb_filter)
         if direction is None:
             continue
 

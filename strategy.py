@@ -19,6 +19,7 @@ def check_entry(
     cooldown: int,
     orb_high: float | None = None,
     orb_low: float | None = None,
+    orb_enabled: bool = False,
 ) -> str | None:
     """Return direction ("CE"/"PE") if entry conditions met, else None.
 
@@ -68,7 +69,9 @@ def check_entry(
         return None
 
     # ORB direction filter — only enter if price broke the opening range
-    if orb_high is not None and orb_low is not None:
+    if orb_enabled:
+        if orb_high is None or orb_low is None:
+            return None  # ORB range not ready yet — block all entries
         if direction == "CE" and row["close"] < orb_high:
             return None
         if direction == "PE" and row["close"] > orb_low:
