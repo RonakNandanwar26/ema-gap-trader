@@ -19,6 +19,8 @@ def send_telegram(message: str) -> bool:
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         resp = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
+        if resp.status_code != 200:
+            logger.warning("Telegram API returned %d: %s", resp.status_code, resp.text[:200])
         return resp.status_code == 200
     except Exception:
         logger.exception("Telegram send failed")

@@ -382,11 +382,12 @@ class Trader:
         self.open_trade = None
         self._last_exit_idx = trade.get("candle_num", 0)
 
+        pnl_text = f"P&L: Rs.{pnl:,.0f}" if pnl else "P&L: N/A"
         msg = (
             f"EXIT {'LIVE' if self.live else 'PAPER'} — {reason}\n"
             f"{trade['dir']} {trade['symbol']}\n"
             f"Entry: Rs.{trade['entry_price']:.1f} → Exit: Rs.{exit_premium:.1f if exit_premium else 0}\n"
-            f"P&L: Rs.{pnl:,.0f}" if pnl else "P&L: N/A"
+            f"{pnl_text}"
         )
         send_telegram(msg)
         logger.info(msg.replace("\n", " | "))
