@@ -335,6 +335,16 @@ with st.sidebar:
     capital = st.number_input("Capital (Rs.)", min_value=10000, max_value=10000000, value=100000, step=10000)
 
     st.markdown("---")
+    st.subheader("Lot Size")
+    lot_multipliers = {}
+    for inst_name, inst_ic in INSTRUMENTS.items():
+        lot_multipliers[inst_name] = st.number_input(
+            f"{inst_name} (1 lot = {inst_ic.lot_size})",
+            min_value=1, max_value=50, value=1, step=1,
+            key=f"lot_mult_{inst_name}",
+        )
+
+    st.markdown("---")
     # Status indicators
     paper_active = [name for name, s in st.session_state.paper_sessions.items() if s.is_running]
     live_active = [name for name, s in st.session_state.live_sessions.items() if s.is_running]
@@ -348,7 +358,23 @@ sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     candle_interval=candle_interval,
                     max_capital_per_trade_pct=max_capital_pct / 100,
                     orb_filter=orb_filter)
-ic = INSTRUMENTS[instrument]
+
+
+def _get_ic(inst_name: str) -> InstrumentConfig:
+    """Return InstrumentConfig with lot_size scaled by the sidebar multiplier."""
+    base = INSTRUMENTS[inst_name]
+    mult = lot_multipliers.get(inst_name, 1)
+    if mult == 1:
+        return base
+    return InstrumentConfig(
+        name=base.name, token=base.token, exchange=base.exchange,
+        nfo_exchange=base.nfo_exchange, lot_size=base.lot_size * mult,
+        strike_interval=base.strike_interval, expiry_weekday=base.expiry_weekday,
+        expiry_type=base.expiry_type, expiry_flag=base.expiry_flag,
+    )
+
+
+ic = _get_ic(instrument)
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -524,21 +550,28 @@ with tab_paper:
     ALL_INSTRUMENTS = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
     # Start/Stop all buttons
+    all_paper_running = all(
+        inst_name in st.session_state.paper_sessions and st.session_state.paper_sessions[inst_name].is_running
+        for inst_name in ALL_INSTRUMENTS
+    )
+    any_paper_running = any(
+        s.is_running for s in st.session_state.paper_sessions.values()
+    )
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Start All Paper", type="primary"):
+        if st.button("Start All Paper", type="primary", disabled=all_paper_running):
             for inst_name in ALL_INSTRUMENTS:
                 if inst_name not in st.session_state.paper_sessions or not st.session_state.paper_sessions[inst_name].is_running:
                     old = st.session_state.paper_sessions.get(inst_name)
                     if old is not None:
                         old.stop()
-                    inst_ic = INSTRUMENTS[inst_name]
+                    inst_ic = _get_ic(inst_name)
                     session = TradingSession(sc, inst_ic, capital, live=False)
                     session.start()
                     st.session_state.paper_sessions[inst_name] = session
             st.rerun()
     with c2:
-        if st.button("Stop All Paper"):
+        if st.button("Stop All Paper", disabled=not any_paper_running):
             for session in st.session_state.paper_sessions.values():
                 session.stop()
             st.rerun()
@@ -547,7 +580,7 @@ with tab_paper:
 
     # Per-instrument panels
     for inst_name in ALL_INSTRUMENTS:
-        inst_ic = INSTRUMENTS[inst_name]
+        inst_ic = _get_ic(inst_name)
         session = st.session_state.paper_sessions.get(inst_name)
         paper_store = TradeStore(inst_name, "paper", get_data_dir())
 
@@ -565,15 +598,16 @@ with tab_paper:
 
             col1, col2 = st.columns([3, 1])
             with col2:
-                if st.button(f"Start {inst_name}", key=f"start_paper_{inst_name}"):
+                paper_inst_running = session is not None and session.is_running
+                if st.button(f"Start {inst_name}", key=f"start_paper_{inst_name}", disabled=paper_inst_running):
                     old = st.session_state.paper_sessions.get(inst_name)
                     if old is not None:
                         old.stop()
-                    s = TradingSession(sc, inst_ic, capital, live=False)
+                    s = TradingSession(sc, _get_ic(inst_name), capital, live=False)
                     s.start()
                     st.session_state.paper_sessions[inst_name] = s
                     st.rerun()
-                if st.button(f"Stop {inst_name}", key=f"stop_paper_{inst_name}"):
+                if st.button(f"Stop {inst_name}", key=f"stop_paper_{inst_name}", disabled=not paper_inst_running):
                     if session:
                         session.stop()
                         st.rerun()
@@ -602,21 +636,28 @@ with tab_live:
                 st.rerun()
     else:
         # Start/Stop all buttons
+        all_live_running = all(
+            inst_name in st.session_state.live_sessions and st.session_state.live_sessions[inst_name].is_running
+            for inst_name in ALL_INSTRUMENTS
+        )
+        any_live_running = any(
+            s.is_running for s in st.session_state.live_sessions.values()
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("Start All Live", type="primary"):
+            if st.button("Start All Live", type="primary", disabled=all_live_running):
                 for inst_name in ALL_INSTRUMENTS:
                     if inst_name not in st.session_state.live_sessions or not st.session_state.live_sessions[inst_name].is_running:
                         old = st.session_state.live_sessions.get(inst_name)
                         if old is not None:
                             old.stop()
-                        inst_ic = INSTRUMENTS[inst_name]
+                        inst_ic = _get_ic(inst_name)
                         session = TradingSession(sc, inst_ic, capital, live=True)
                         session.start()
                         st.session_state.live_sessions[inst_name] = session
                 st.rerun()
         with c2:
-            if st.button("Stop All Live"):
+            if st.button("Stop All Live", disabled=not any_live_running):
                 for session in st.session_state.live_sessions.values():
                     session.stop()
                 st.rerun()
@@ -631,7 +672,7 @@ with tab_live:
 
         # Per-instrument panels
         for inst_name in ALL_INSTRUMENTS:
-            inst_ic = INSTRUMENTS[inst_name]
+            inst_ic = _get_ic(inst_name)
             session = st.session_state.live_sessions.get(inst_name)
             live_store = TradeStore(inst_name, "live", get_data_dir())
 
@@ -649,15 +690,16 @@ with tab_live:
 
                 col1, col2 = st.columns([3, 1])
                 with col2:
-                    if st.button(f"Start {inst_name}", key=f"start_live_{inst_name}"):
+                    live_inst_running = session is not None and session.is_running
+                    if st.button(f"Start {inst_name}", key=f"start_live_{inst_name}", disabled=live_inst_running):
                         old = st.session_state.live_sessions.get(inst_name)
                         if old is not None:
                             old.stop()
-                        s = TradingSession(sc, inst_ic, capital, live=True)
+                        s = TradingSession(sc, _get_ic(inst_name), capital, live=True)
                         s.start()
                         st.session_state.live_sessions[inst_name] = s
                         st.rerun()
-                    if st.button(f"Stop {inst_name}", key=f"stop_live_{inst_name}"):
+                    if st.button(f"Stop {inst_name}", key=f"stop_live_{inst_name}", disabled=not live_inst_running):
                         if session:
                             session.stop()
                             st.rerun()
