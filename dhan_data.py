@@ -132,7 +132,7 @@ def init_dhan() -> dict:
         RuntimeError: If credentials are not set.
     """
     client_id = os.environ.get("DHAN_CLIENT_ID", "")
-    access_token = os.environ.get("DHAN_ACCESS_TOKEN", "")
+    access_token = _get_dhan_token()
 
     if not client_id or not access_token:
         raise RuntimeError(
@@ -445,7 +445,7 @@ def fetch_expired_option_candles(
 
     exchange_segment = _EXCHANGE_SEGMENTS[instrument_name.upper()]
     headers = {
-        "access-token": dhan_creds["access_token"],
+        "access-token": _get_dhan_token(),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -727,7 +727,7 @@ def _fetch_intraday_chunk(
 ) -> pd.DataFrame:
     """Fetch a single chunk of intraday data (must be ≤ 90 days)."""
     headers = {
-        "access-token": dhan_creds["access_token"],
+        "access-token": _get_dhan_token(),
         "Content-Type": "application/json",
     }
     security_id = _SECURITY_IDS[instrument_name.upper()]
@@ -903,7 +903,7 @@ def _fetch_index_daily_api(
 
     exchange_segment = _INDEX_SEGMENTS[instrument_name.upper()]
     headers = {
-        "access-token": dhan_creds["access_token"],
+        "access-token": _get_dhan_token(),
         "Content-Type": "application/json",
     }
 
