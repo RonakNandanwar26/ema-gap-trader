@@ -24,6 +24,7 @@ class StrategyConfig:
     candle_interval: int  # 5 or 15
     max_capital_per_trade_pct: float  # e.g. 0.25 = 25% of equity
     orb_filter: bool  # require price to break ORB range before entry
+    ema_gap_floor: float = 0.0  # exit if ema_gap_pct drops below this after 2+ candles; 0 disables
 
 
 @dataclass
@@ -84,6 +85,7 @@ def get_strategy_config() -> StrategyConfig:
         candle_interval=int(os.getenv("CANDLE_INTERVAL", "15")),
         max_capital_per_trade_pct=float(os.getenv("MAX_CAPITAL_PER_TRADE_PCT", "0.25")),
         orb_filter=os.getenv("ORB_FILTER", "true").lower() == "true",
+        ema_gap_floor=float(os.getenv("EMA_GAP_FLOOR", "0")),
     )
 
 

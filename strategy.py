@@ -85,6 +85,7 @@ def check_exit(
     trade_dir: str,
     candles_held: int,
     max_hold: int,
+    ema_gap_floor: float = 0.0,
 ) -> str | None:
     """Return exit reason string if exit conditions met, else None."""
     # 1. SuperTrend flip
@@ -99,7 +100,12 @@ def check_exit(
     if trade_dir == "PE" and row["ema9"] > row["ema21"]:
         return "EMA_cross"
 
-    # 3. Max hold
+    # 3. EMA gap contraction — trend dying, bail before theta chews the premium.
+    # Min 2 candles held so we don't bail on entry-candle wiggles.
+    if ema_gap_floor > 0 and candles_held >= 2 and row["ema_gap_pct"] < ema_gap_floor:
+        return "gap_contract"
+
+    # 4. Max hold
     if candles_held >= max_hold:
         return "max_hold"
 

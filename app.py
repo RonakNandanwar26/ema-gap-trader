@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import threading
 import time
 import traceback
@@ -57,12 +58,14 @@ class TradingStatus:
 
 
 class TradingSession:
-    def __init__(self, strat_config: StrategyConfig, inst_config: InstrumentConfig, capital: int, live: bool = False):
+    def __init__(self, strat_config: StrategyConfig, inst_config: InstrumentConfig, capital: int, live: bool = False, variant: str = ""):
         self.sc = strat_config
         self.ic = inst_config
         self.capital = capital
         self.live = live
-        self._store = TradeStore(inst_config.name, "live" if live else "paper", get_data_dir())
+        self.variant = variant
+        store_key = f"{inst_config.name}-{variant}" if variant else inst_config.name
+        self._store = TradeStore(store_key, "live" if live else "paper", get_data_dir())
         self._trader: Trader | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -80,7 +83,7 @@ class TradingSession:
             return
         self._error = None
         self._user_stopped = False
-        self._trader = Trader(self.sc, self.ic, self.capital, live=self.live, trade_store=self._store)
+        self._trader = Trader(self.sc, self.ic, self.capital, live=self.live, trade_store=self._store, label=self.variant)
         self._thread = threading.Thread(target=self._run, daemon=True, name="trader-thread")
         self._thread.start()
 
@@ -340,6 +343,23 @@ with st.sidebar:
                                 help="Max % of equity to spend on a single trade. Moves to OTM strike if ATM exceeds budget.")
     orb_filter = st.checkbox("ORB Filter", value=True,
                              help="Only enter CE above opening range high, PE below opening range low (first 30 min).")
+    ema_gap_floor = st.number_input(
+        "EMA Gap Floor Exit %",
+        min_value=0.0, max_value=1.0,
+        value=float(os.getenv("EMA_GAP_FLOOR", "0.0")),
+        step=0.01, format="%.2f",
+        help="Exit when ema_gap_pct drops below this floor after 2+ candles held. 0 disables. "
+             "Default reads EMA_GAP_FLOOR env var.",
+    )
+    variant_gap_floor = st.number_input(
+        "A/B variant EMA Gap Floor %",
+        min_value=0.0, max_value=1.0,
+        value=float(os.getenv("EMA_GAP_FLOOR_VARIANT", "0.05")),
+        step=0.01, format="%.2f",
+        help="Second paper session runs with this gap_floor for A/B testing. "
+             "Default reads EMA_GAP_FLOOR_VARIANT env var. Changing this only affects NEW variant sessions, "
+             "not ones already running.",
+    )
     capital = st.number_input("Capital (Rs.)", min_value=10000, max_value=10000000, value=100000, step=10000)
 
     st.markdown("---")
@@ -365,7 +385,37 @@ sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     max_hold_candles=max_hold, cooldown_candles=cooldown,
                     candle_interval=candle_interval,
                     max_capital_per_trade_pct=max_capital_pct / 100,
-                    orb_filter=orb_filter)
+                    orb_filter=orb_filter,
+                    ema_gap_floor=ema_gap_floor)
+
+
+# ---------------------------------------------------------------------------
+# Paper A/B variants
+# ---------------------------------------------------------------------------
+# Baseline ("" variant) uses whatever the sidebar gap_floor says.
+# The A/B "variant" forces ema_gap_floor = sidebar variant_gap_floor value,
+# regardless of what the baseline is running with.
+
+PAPER_VARIANT_KEYS: list[str] = ["", "variant"]
+
+
+def _variant_label(variant: str) -> str:
+    if not variant:
+        return "baseline"
+    if variant == "variant":
+        return f"variant: gap_floor={variant_gap_floor:.2f}%"
+    return variant
+
+
+def _sc_for_variant(variant: str) -> StrategyConfig:
+    """Return a StrategyConfig with per-variant overrides applied on top of sidebar sc."""
+    if variant == "variant":
+        return StrategyConfig(**{**sc.__dict__, "ema_gap_floor": variant_gap_floor})
+    return sc
+
+
+def _paper_session_key(inst_name: str, variant: str) -> str:
+    return f"{inst_name}-{variant}" if variant else inst_name
 
 
 def _get_ic(inst_name: str) -> InstrumentConfig:
@@ -654,41 +704,61 @@ with tab_paper:
 
     st.markdown("---")
 
-    # Per-instrument panels
+    # Per-instrument panels (baseline + variants)
     for inst_name in ALL_INSTRUMENTS:
         inst_ic = _get_ic(inst_name)
-        session = st.session_state.paper_sessions.get(inst_name)
-        paper_store = TradeStore(inst_name, "paper", get_data_dir())
+        base_session = st.session_state.paper_sessions.get(inst_name)
+        any_variant_running = any(
+            s.is_running for k, s in st.session_state.paper_sessions.items()
+            if k == inst_name or k.startswith(f"{inst_name}-")
+        )
 
-        with st.expander(f"{inst_name} (Lot: {inst_ic.lot_size})", expanded=session is not None and session.is_running):
-            # Recovery warning
-            if session is None or not session.is_running:
-                open_trade = paper_store.load_open_trade()
-                if open_trade:
-                    st.warning(
-                        f"Unclosed position from previous session: "
-                        f"{open_trade.get('dir')} {open_trade.get('symbol', '?')} "
-                        f"@ Rs.{open_trade.get('entry_price', 0):.1f}. "
-                        f"Start the session to auto-recover."
-                    )
+        with st.expander(f"{inst_name} (Lot: {inst_ic.lot_size})", expanded=any_variant_running):
+            for variant in PAPER_VARIANT_KEYS:
+                variant_label = _variant_label(variant)
+                session_key = _paper_session_key(inst_name, variant)
+                store_key = session_key
+                session = st.session_state.paper_sessions.get(session_key)
+                variant_store = TradeStore(store_key, "paper", get_data_dir())
 
-            col1, col2 = st.columns([3, 1])
-            with col2:
-                paper_inst_running = session is not None and session.is_running
-                if st.button(f"Start {inst_name}", key=f"start_paper_{inst_name}", disabled=paper_inst_running):
-                    old = st.session_state.paper_sessions.get(inst_name)
-                    if old is not None:
-                        old.stop()
-                    s = TradingSession(sc, _get_ic(inst_name), capital, live=False)
-                    s.start()
-                    st.session_state.paper_sessions[inst_name] = s
-                    st.rerun()
-                if st.button(f"Stop {inst_name}", key=f"stop_paper_{inst_name}", disabled=not paper_inst_running):
-                    if session:
-                        session.stop()
+                if variant:
+                    st.markdown("---")
+                st.markdown(f"**{variant_label}**")
+
+                # Recovery warning
+                if session is None or not session.is_running:
+                    open_trade = variant_store.load_open_trade()
+                    if open_trade:
+                        st.warning(
+                            f"Unclosed position from previous session: "
+                            f"{open_trade.get('dir')} {open_trade.get('symbol', '?')} "
+                            f"@ Rs.{open_trade.get('entry_price', 0):.1f}. "
+                            f"Start the session to auto-recover."
+                        )
+
+                col1, col2 = st.columns([3, 1])
+                with col2:
+                    running = session is not None and session.is_running
+                    start_btn_label = f"Start {inst_name}" if not variant else f"Start {variant}"
+                    stop_btn_label = f"Stop {inst_name}" if not variant else f"Stop {variant}"
+                    if st.button(start_btn_label, key=f"start_paper_{session_key}", disabled=running):
+                        old = st.session_state.paper_sessions.get(session_key)
+                        if old is not None:
+                            old.stop()
+                        s = TradingSession(
+                            _sc_for_variant(variant), _get_ic(inst_name), capital,
+                            live=False, variant=variant,
+                        )
+                        s.start()
+                        st.session_state.paper_sessions[session_key] = s
                         st.rerun()
-            with col1:
-                _render_trading_panel(session, f"paper {inst_name}", store=paper_store)
+                    if st.button(stop_btn_label, key=f"stop_paper_{session_key}", disabled=not running):
+                        if session:
+                            session.stop()
+                            st.rerun()
+                with col1:
+                    panel_label = f"paper {inst_name}" if not variant else f"paper {inst_name} [{variant}]"
+                    _render_trading_panel(session, panel_label, store=variant_store)
 
 
 # ---------------------------------------------------------------------------

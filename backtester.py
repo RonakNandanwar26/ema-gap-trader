@@ -137,7 +137,7 @@ def run_backtest(
         # === EXIT ===
         if open_trade is not None:
             candles_held = i - open_trade["idx"]
-            reason = check_exit(row, open_trade["dir"], candles_held, sc.max_hold_candles)
+            reason = check_exit(row, open_trade["dir"], candles_held, sc.max_hold_candles, sc.ema_gap_floor)
 
             if reason:
                 ep = None

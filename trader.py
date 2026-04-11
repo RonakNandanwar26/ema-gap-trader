@@ -33,6 +33,7 @@ class Trader:
         capital: int | None = None,
         live: bool = False,
         trade_store: TradeStore | None = None,
+        label: str = "",
     ):
         self.sc = strat_config or get_strategy_config()
         self.ic = inst_config or get_instrument_config()
@@ -40,6 +41,7 @@ class Trader:
         self.current_equity = float(self.initial_capital)
         self.live = live
         self._store = trade_store
+        self._label = label  # optional tag (e.g. variant name) for log / telegram disambiguation
 
         self.open_trade: dict | None = None
         self.trades: list[dict] = []
@@ -108,11 +110,13 @@ class Trader:
                 logger.exception("WebSocket setup failed — falling back to polling")
                 self._tick_manager = None
 
+        tag = f"[{self._label}] " if self._label else ""
         send_telegram(
-            f"{'LIVE' if self.live else 'PAPER'} trader started\n"
+            f"{tag}{'LIVE' if self.live else 'PAPER'} trader started\n"
             f"Instrument: {self.ic.name}\n"
             f"Mode: crossover + {self.sc.extra_entry_mode}\n"
             f"Gap min: {self.sc.ema_gap_min}%\n"
+            f"Gap floor: {self.sc.ema_gap_floor}%\n"
             f"Expiry: {self._current_expiry}\n"
             f"WebSocket: {'ON' if self._tick_manager else 'OFF'}"
         )
@@ -132,7 +136,7 @@ class Trader:
 
             # Fetch candles
             df = self._fetch_candles(today)
-            if df is None or len(df) < 3:
+            if df is None or len(df) < 10:
                 logger.debug("Not enough candles yet (%d), waiting...", len(df) if df is not None else 0)
                 time_mod.sleep(30)
                 continue
@@ -172,7 +176,7 @@ class Trader:
             # Exit check on completed candle
             if self.open_trade is not None:
                 candles_held = candle_count - self.open_trade.get("candle_num", 0)
-                reason = check_exit(row, self.open_trade["dir"], candles_held, self.sc.max_hold_candles)
+                reason = check_exit(row, self.open_trade["dir"], candles_held, self.sc.max_hold_candles, self.sc.ema_gap_floor)
                 if reason:
                     logger.info("EXIT SIGNAL (candle): %s after %d candles", reason, candles_held)
                     self._process_exit(reason, row)
@@ -213,8 +217,9 @@ class Trader:
         if self.open_trade is not None:
             logger.info("Market close — carrying forward open position: %s %s",
                         self.open_trade["dir"], self.open_trade.get("symbol"))
+            tag = f"[{self._label}] " if self._label else ""
             send_telegram(
-                f"CARRY FORWARD\n"
+                f"{tag}CARRY FORWARD\n"
                 f"{self.open_trade['dir']} {self.open_trade.get('symbol', '')}\n"
                 f"Entry: Rs.{self.open_trade.get('entry_price', 0):.1f}\n"
                 f"Position will resume next trading day."
@@ -225,8 +230,9 @@ class Trader:
             self._tick_manager.stop()
 
         self.running = False
+        tag = f"[{self._label}] " if self._label else ""
         send_telegram(
-            f"{'LIVE' if self.live else 'PAPER'} session ended\n"
+            f"{tag}{'LIVE' if self.live else 'PAPER'} session ended\n"
             f"Trades: {len(self.trades)}\n"
             f"Equity: Rs.{self.current_equity:,.0f}"
         )
@@ -308,8 +314,9 @@ class Trader:
             self._tick_manager.subscribe(token, opt_exchange)
 
         otm_note = f" (OTM from ATM {atm_strike})" if strike != atm_strike else ""
+        tag = f"[{self._label}] " if self._label else ""
         msg = (
-            f"ENTRY {'LIVE' if self.live else 'PAPER'}\n"
+            f"{tag}ENTRY {'LIVE' if self.live else 'PAPER'}\n"
             f"{direction} {symbol} @ Rs.{premium:.1f}{otm_note}\n"
             f"Spot: {spot:.1f} | Strike: {strike} | Cost: Rs.{premium * qty:,.0f}\n"
             f"RSI: {row.get('rsi', 0):.1f} | Gap: {row.get('ema_gap_pct', 0):.3f}%"
@@ -383,10 +390,11 @@ class Trader:
         self._last_exit_idx = trade.get("candle_num", 0)
 
         pnl_text = f"P&L: Rs.{pnl:,.0f}" if pnl else "P&L: N/A"
+        tag = f"[{self._label}] " if self._label else ""
         msg = (
-            f"EXIT {'LIVE' if self.live else 'PAPER'} — {reason}\n"
+            f"{tag}EXIT {'LIVE' if self.live else 'PAPER'} — {reason}\n"
             f"{trade['dir']} {trade['symbol']}\n"
-            f"Entry: Rs.{trade['entry_price']:.1f} → Exit: Rs.{exit_premium:.1f if exit_premium else 0}\n"
+            f"Entry: Rs.{trade['entry_price']:.1f} → Exit: Rs.{(exit_premium if exit_premium else 0):.1f}\n"
             f"{pnl_text}"
         )
         send_telegram(msg)
@@ -422,12 +430,16 @@ class Trader:
         virtual_df = pd.concat([df, pd.DataFrame([virtual_row])], ignore_index=True)
 
         # Recompute indicators on extended DataFrame
-        virtual_df = compute_indicators(virtual_df)
+        try:
+            virtual_df = compute_indicators(virtual_df)
+        except Exception:
+            logger.debug("compute_indicators failed on virtual candle, skipping check")
+            return None
         virtual_last = virtual_df.iloc[-1]
 
         # Check exit on virtual row
         candles_held = candle_count - self.open_trade.get("candle_num", 0)
-        reason = check_exit(virtual_last, self.open_trade["dir"], candles_held, self.sc.max_hold_candles)
+        reason = check_exit(virtual_last, self.open_trade["dir"], candles_held, self.sc.max_hold_candles, self.sc.ema_gap_floor)
         return reason
 
     def _sleep_with_exit_monitoring(self, candle_count: int) -> None:
