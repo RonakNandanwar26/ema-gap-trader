@@ -27,11 +27,14 @@ certbot (Let's Encrypt), DuckDNS, fail2ban, AWS CloudWatch agent, AWS SNS.
 ## Phase 1 — Local code changes (TDD where applicable)
 
 These run on your laptop on a feature branch. Nothing in Phase 1 touches AWS.
-The whole phase should be done and merged before you provision the instance,
-because the deploy script in Phase 2 just `git pull`s whatever is on `main`.
+The whole phase should be done and pushed before you provision the instance,
+because the deploy script in Phase 2 just `git pull`s whatever is on the
+deploy branch on the EC2 box.
 
-**Branch:** create `feat/aws-deployment` from `main` and stay on it for all of
-Phase 1. Only merge to `main` after Task 7.
+**Branch:** Phase 1 was completed on `feat/initial-setup`, then a sibling
+branch `feat/aws-deployment` was created from the same HEAD and pushed to
+`origin`. The EC2 box in Phase 2 will track `feat/aws-deployment` so deploys
+are decoupled from other in-flight work on `feat/initial-setup` or `main`.
 
 ### Task 1: Add `_get_dhan_token()` helper to `dhan_data.py`
 
@@ -730,21 +733,16 @@ self-rotating."
 
 ---
 
-### Phase 1 wrap-up: merge to main
+### Phase 1 wrap-up — DONE
 
-- [ ] **Open a PR for `feat/aws-deployment` and merge it to `main`.**
-
-You'll deploy whatever is on `main`, so all six commits from Tasks 1–7 must
-be on `main` before Phase 2 starts. Run the test suite one more time on
-`main` after the merge to confirm green.
+Phase 1 was executed inline. All seven commits live on both
+`feat/initial-setup` (local dev branch) and `feat/aws-deployment` (the
+push-to-deploy branch on `origin`). Test suite is 135/135 green.
 
 ```bash
-git checkout main
-git pull
-.venv/bin/pytest -q
+git log --oneline feat/aws-deployment | head -10
+git push origin feat/aws-deployment   # already done
 ```
-
-Expected: all green.
 
 ---
 
@@ -999,15 +997,17 @@ key in `~/.ssh/` on the box):
 ```bash
 ssh ema-trader '
     cd /opt
-    git clone <YOUR_REPO_HTTPS_OR_SSH_URL> ema-gap-trader
+    git clone https://github.com/RonakNandanwar26/ema-gap-trader.git ema-gap-trader
     cd ema-gap-trader
-    git checkout main
+    git checkout feat/aws-deployment
     git log -1 --oneline
 '
 ```
 
-Expected: clone succeeds, prints the latest commit on `main` (should match
-the merge from Phase 1).
+Expected: clone succeeds, prints the latest commit on `feat/aws-deployment`
+— at the time of writing this is `19f6c0d chore(deploy): add nginx site +
+logrotate configs`. If the repo is private, swap the HTTPS URL for an SSH
+URL and place a deploy key in `~/.ssh/` on the box first.
 
 - [ ] **Step 2: Build the venv and install requirements**
 
