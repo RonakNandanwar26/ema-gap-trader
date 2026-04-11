@@ -24,10 +24,17 @@ without ceremony.
 
 ## Architecture Overview
 
-A single AWS EC2 instance in `ap-south-1` (Mumbai) runs four long-lived
-processes managed by systemd, fronted by nginx with Let's Encrypt TLS. All
-state (SQLite, the ~1.5 GB Dhan option cache, logs) lives on the instance's
-EBS root volume. No RDS, no S3, no load balancer, no container runtime.
+A single AWS EC2 instance in `ap-south-1` (Mumbai) runs **two** long-lived
+processes managed by systemd: the existing `app.py` Streamlit application
+(which already covers backtest, paper, and live trading in a single UI) and
+nginx as a reverse proxy with Let's Encrypt TLS and basic auth. All state
+(SQLite, the ~1.5 GB Dhan option cache, logs) lives on the instance's EBS
+root volume. No RDS, no S3, no load balancer, no container runtime.
+
+The live `Trader` runs as a **daemon thread inside the Streamlit process** —
+this matches the existing local-development behaviour and requires no
+refactor. Stopping/restarting the Streamlit service stops the trader along
+with it; systemd's `Restart=always` brings it back within seconds.
 
 ```
                     Internet
@@ -37,12 +44,15 @@ EBS root volume. No RDS, no S3, no load balancer, no container runtime.
         │  EC2 t4g.small (ap-south-1)  │
         │  Ubuntu 22.04, IST timezone  │
         │                              │
-        │  nginx :443  ──┬──► :8000  app.py (Flask dashboard)
-        │  (LE TLS,      │
-        │   basic auth)  └──► :8501  Streamlit (backtest UI)
+        │  nginx :443  ──────► :8501   │
+        │  (LE TLS,                    │
+        │   basic auth)        Streamlit app.py
+        │                       ├── Backtest tab
+        │                       ├── Paper Trading tab
+        │                       └── Live Trading tab (daemon thread)
         │                              │
-        │  systemd: ema-trader.service │  ◄── Angel One SmartAPI
-        │                              │       (live + paper trading)
+        │  systemd: ema-app.service    │  ◄── Angel One SmartAPI (live/paper)
+        │                              │  ◄── Dhan API (backtest history)
         │  EBS gp3 30 GB:              │
         │   /opt/ema-gap-trader/       │
         │   /etc/ema-trader/           │
@@ -76,46 +86,43 @@ sits in Mumbai for trading latency, not for human UI latency.
 
 ## Section 2 — Components
 
-Four long-lived processes, each a systemd unit with `Restart=always` and
-`After=network-online.target`. All run as the unprivileged `ubuntu` user.
+Two long-lived processes, each a systemd unit with `Restart=always` and
+`After=network-online.target`. Both run as the unprivileged `ubuntu` user.
 
-### 2.1 `ema-trader.service`
-- Runs `python trader.py` from `/opt/ema-gap-trader` using the project venv
-- The live (or paper) trading bot — places orders via Angel One SmartAPI
-- Logs to journald → CloudWatch agent forwards to a log group (see §5.1)
+### 2.1 `ema-app.service`
+- Runs `streamlit run app.py --server.address=127.0.0.1 --server.port=8501
+  --server.headless=true` from `/opt/ema-gap-trader` using the project venv
+- This is the **only** application process. The existing `app.py`
+  (`"""app.py — Streamlit dashboard: Backtest | Paper Trading | Live
+  Trading."""`) already covers all three modes — it imports `Trader` from
+  `trader.py` and runs it as a daemon thread inside the Streamlit process
+  when the user clicks "Start" on the Live or Paper Trading tab
+- Loads `EnvironmentFile=/etc/ema-trader/app.env` for permanent secrets
+- Logs to journald → CloudWatch agent forwards to log group
+  `/ema-gap-trader/app`
 - Restart on crash; restart on boot
+- Backtests run on demand from the UI as CPU bursts on the same box. The
+  2 vCPU `t4g.small` can handle them; if a sweep starts hurting live tick
+  processing, the user can either (a) temporarily resize the instance or
+  (b) run the sweep on a laptop using the same code
 
-### 2.2 `ema-dashboard.service`
-- Runs `app.py` (existing Flask/FastAPI monitoring UI) bound to
-  `127.0.0.1:8000`
-- Not directly exposed; reached only through the nginx reverse proxy
-
-### 2.3 `ema-backtest.service`
-- Runs `streamlit run <backtest_app>.py` bound to `127.0.0.1:8501`
-- Hosts the on-demand backtest UI and the Dhan-token update widget (see §3)
-- Backtests are CPU bursts on the same box. The 2 vCPU `t4g.small` can
-  handle them; if a sweep starts hurting the live trader's tick processing,
-  the user can either (a) temporarily resize the instance or (b) run the
-  sweep on a laptop using the same code
-
-### 2.4 `nginx`
+### 2.2 `nginx`
 - Reverse proxy on port 443, terminates Let's Encrypt TLS
 - HTTP basic auth (single user) protects everything
-- Routes:
-  - `https://<host>/` → `127.0.0.1:8000` (dashboard)
-  - `https://<host>/backtest/` → `127.0.0.1:8501` (Streamlit; needs WebSocket
-    upgrade headers `Upgrade` and `Connection`)
+- Single upstream: `https://<host>/` → `127.0.0.1:8501` (Streamlit;
+  needs WebSocket upgrade headers `Upgrade` and `Connection`)
 - Port 80 serves only the ACME challenge and 301-redirects everything else
   to 443
 
 **No Docker.** Direct Python `.venv` + systemd. A single-tenant box does not
 benefit from a container layer; it just adds moving parts.
 
-**Open question (resolved during implementation, not blocking):** the exact
-framework and entry-point for `app.py` (Flask vs FastAPI vs something else)
-and the exact module name of the Streamlit backtest app. The systemd unit
-files need to match — the implementation plan will start by reading these
-two files.
+**Lifecycle note:** because the live trader runs *inside* the Streamlit
+process as a daemon thread, restarting `ema-app.service` stops the trader.
+This matches the existing local-development behaviour. If the
+streamlit-as-trader-host model becomes a reliability problem in practice,
+extracting `trader.py` into a standalone service is a future refactor that
+this deployment does not require.
 
 ## Section 3 — Persistence and Secrets
 
@@ -167,47 +174,74 @@ live trader — it logs in fresh whenever the cached session goes stale.
 
 `DHAN_ACCESS_TOKEN` is a daily-expiring JWT used **only** by `dhan_data.py`
 for backtest historical fetching. The live trader does not touch Dhan at
-all. So the only consumer of the rotating token is the Streamlit backtest
-service.
+all.
 
 **Mechanism:** the token lives in `/etc/ema-trader/dhan.token`.
 `dhan_data.py` reads it just-in-time on every Dhan API call (no cache /
 TTL = 0 — backtests are not latency-sensitive and a file read is microseconds).
 
-**Code change required in `dhan_data.py`:**
+**Call sites in `dhan_data.py` that currently consume the token (verified
+by reading the file):**
+- `init_dhan()` at line 117 — reads `os.environ.get("DHAN_ACCESS_TOKEN", "")`
+  and validates it via a `/v2/fundlimit` request
+- Three header constructions of `"access-token": dhan_creds["access_token"]`
+  at lines 430, 712, and 888
+
+**Refactor:** introduce one helper, `_get_dhan_token()`, and replace all
+four sites with calls to it. `init_dhan()` keeps its responsibility of
+*validating* the current token at startup (so the user gets a clear
+"regenerate from dhanhq.co" error early), but it no longer holds the token
+in the dict it returns. Subsequent header constructions call
+`_get_dhan_token()` directly.
 
 ```python
+# dhan_data.py
+from pathlib import Path
+
 _DHAN_TOKEN_PATH = os.environ.get("DHAN_TOKEN_PATH", "/etc/ema-trader/dhan.token")
 
 def _get_dhan_token() -> str:
     """Read the Dhan access token from disk on every call.
 
-    The token is rotated daily by the user via the Streamlit admin widget;
-    reading per-call ensures we always use the latest value without needing
-    to restart the service.
+    The token is rotated daily by the user via the Streamlit admin widget
+    (see app.py). Reading per-call ensures we always use the latest value
+    without needing to restart the service.
     """
     try:
         return Path(_DHAN_TOKEN_PATH).read_text().strip()
     except FileNotFoundError:
-        # Local-dev fallback — env var still works for CLI / pytest
         return os.environ.get("DHAN_ACCESS_TOKEN", "")
 ```
 
-Replace the single `os.environ.get("DHAN_ACCESS_TOKEN", "")` lookup in
-`init_dhan()` (and any other call sites) with `_get_dhan_token()`.
+Then at lines 430, 712, 888, replace `dhan_creds["access_token"]` with
+`_get_dhan_token()`. Inside `init_dhan()`, replace the env-var read at
+line 117 with `_get_dhan_token()` and (optionally) drop `access_token` from
+the returned dict — leaving `dhan_creds = {"client_id": ...}`.
 
-**Streamlit admin widget** (added to the backtest app sidebar):
+**Streamlit admin widget** (added to `app.py` — top of the sidebar so it's
+visible from every tab):
 
 ```python
-with st.sidebar.expander("Dhan token"):
-    new_token = st.text_input("Paste new Dhan access token", type="password")
-    if st.button("Save"):
-        Path("/etc/ema-trader/dhan.token").write_text(new_token.strip())
-        st.success("Saved. Next backtest will use it.")
+import os
+from pathlib import Path
+
+_DHAN_TOKEN_PATH = Path(os.environ.get("DHAN_TOKEN_PATH", "/etc/ema-trader/dhan.token"))
+
+with st.sidebar.expander("Dhan token (daily refresh)"):
+    current = "set" if _DHAN_TOKEN_PATH.exists() and _DHAN_TOKEN_PATH.read_text().strip() else "MISSING"
+    st.caption(f"Current: {current} ({_DHAN_TOKEN_PATH})")
+    new_token = st.text_input("Paste new Dhan access token", type="password", key="dhan_token_input")
+    if st.button("Save token"):
+        if not new_token.strip():
+            st.error("Empty token — not saved.")
+        else:
+            _DHAN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _DHAN_TOKEN_PATH.write_text(new_token.strip())
+            st.success("Saved. Next Dhan call will use it.")
 ```
 
-Both Streamlit and `dhan_data.py` run as the `ubuntu` user, so the file
-permissions just work.
+The Streamlit process and `dhan_data.py` both run as the `ubuntu` user, so
+the file permissions just work.
 
 **Daily flow for the user:**
 1. Open the Streamlit dashboard in a browser
@@ -224,10 +258,10 @@ database) should be revisited at that time.
 
 ### 3.5 Logs
 
-`logrotate` rotates any file-based logs daily, keeps 7 days locally. The
-CloudWatch agent forwards journald output for both `ema-trader` and
-`ema-backtest` to CloudWatch log groups with 7-day retention. (Free tier is
-5 GB/month — well above expected volume.)
+`logrotate` rotates any file-based logs in `/opt/ema-gap-trader/logs/`
+daily, keeps 7 days locally. The CloudWatch agent forwards journald output
+for `ema-app.service` to the CloudWatch log group `/ema-gap-trader/app`
+with 7-day retention. (Free tier is 5 GB/month — well above expected volume.)
 
 ## Section 4 — Network and Access
 
@@ -277,22 +311,19 @@ server {
     listen 443 ssl http2;
     server_name ema-trader-<user>.duckdns.org;
 
-    ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/ema-trader-<user>.duckdns.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ema-trader-<user>.duckdns.org/privkey.pem;
 
     auth_basic           "ema-trader";
     auth_basic_user_file /etc/nginx/.htpasswd;
 
+    # Streamlit serves the entire UI (Backtest / Paper / Live tabs)
     location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $remote_addr;
-    }
-
-    location /backtest/ {
-        proxy_pass http://127.0.0.1:8501/;
+        proxy_pass http://127.0.0.1:8501;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 86400;
@@ -308,21 +339,26 @@ server {
 service back within seconds. Most "the bot died" cases are silently solved
 without producing an alert at all.
 
-**Layer 2 — Telegram alerts via existing `notifications.py`.** Wire into the
-critical paths:
+**Layer 2 — Telegram alerts via existing `notifications.py`.**
+`notifications.py` already exposes `send_telegram(message)` and reads
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from the environment. The
+deployment work is purely *wiring it into the right call sites* — those
+edits live in the `Trader` class in `trader.py` since that's where login
+and order placement happen. Sites to wire:
 
-- Trader startup: `Trader started, logged into Angel One as <client_id>`
-- Login failure: `Angel One login failed: <error>`
+- Trader thread startup: `Trader started, logged into Angel One as <client_id>`
+- Angel One login failure: `Angel One login failed: <error>`
 - Order placement failure: `Order failed for <symbol>: <error>`
 - Daily summary at market close: `Today: N trades, P&L Rs.X`
 
-Free, push-to-phone, no AWS spend.
+The implementation plan will discover whether any of these are already
+wired and only add the missing ones. Free, push-to-phone, no AWS spend.
 
 **Layer 3 — CloudWatch instance alarm.** The one case Telegram alerts can't
 cover: the whole instance is down. For that:
 
-- CloudWatch agent installed, forwards journald logs from `ema-trader` and
-  `ema-backtest` to log groups
+- CloudWatch agent installed, forwards journald logs from `ema-app.service`
+  to log group `/ema-gap-trader/app`
 - One alarm: `StatusCheckFailed_Instance > 0 for 5 consecutive minutes` →
   SNS topic → email
 - Free tier covers 10 alarms + 1,000 SNS emails/month
@@ -346,8 +382,8 @@ ssh "$EC2_HOST" '
     cd /opt/ema-gap-trader
     git pull
     .venv/bin/pip install -r requirements.txt
-    sudo systemctl restart ema-trader ema-dashboard ema-backtest
-    sudo systemctl status ema-trader --no-pager | head -20
+    sudo systemctl restart ema-app
+    sudo systemctl status ema-app --no-pager | head -20
 '
 ```
 
@@ -379,28 +415,33 @@ Effectively $0 while AWS credits last.
 ## Required Code Changes
 
 These are application-level changes the deployment depends on. The
-implementation plan will sequence them.
+implementation plan sequences them.
 
-1. **`dhan_data.py`** — replace direct `os.environ.get("DHAN_ACCESS_TOKEN")`
-   reads with a `_get_dhan_token()` helper that reads from
-   `/etc/ema-trader/dhan.token` per call, with env-var fallback for local
-   dev / pytest.
-2. **Streamlit backtest app** — add the sidebar "Dhan token" widget that
-   writes `/etc/ema-trader/dhan.token`.
-3. **`notifications.py` integrations** — add the four alert sites listed in
-   §5.1 if they don't already exist.
+1. **`dhan_data.py`** — introduce `_get_dhan_token()`; replace the
+   `os.environ.get("DHAN_ACCESS_TOKEN", "")` read at line 117 and the three
+   `dhan_creds["access_token"]` reads at lines 430, 712, 888.
+2. **`app.py`** — add the sidebar "Dhan token" widget shown in §3.3.
+3. **`trader.py`** — wire the four `send_telegram(...)` call sites listed
+   in §5.1 if they don't already exist (verified during implementation).
 4. **`deploy.sh`** — new file at repo root.
-5. **systemd unit files** — `ema-trader.service`, `ema-dashboard.service`,
-   `ema-backtest.service` checked into `deploy/systemd/` in the repo.
+5. **systemd unit file** — `ema-app.service` checked into `deploy/systemd/`
+   in the repo.
 6. **nginx config + logrotate config** — checked into `deploy/nginx/` and
    `deploy/logrotate/`.
 
-## Open Questions Deferred to Implementation
+## Verified During Brainstorming
 
-- Exact framework / entry-point of `app.py` (Flask vs FastAPI vs other) —
-  determined by reading the file at plan time.
-- Exact module name and entry point of the Streamlit backtest app — same.
-- Whether `notifications.py` already wraps the four alert sites or needs
-  new call sites added.
-- Whether `requirements.txt` already pins `streamlit` (it must, for the
-  backtest service).
+These were uncertain when brainstorming started and have been resolved by
+reading the codebase:
+
+- `app.py` is a **Streamlit** app (not Flask/FastAPI). First docstring
+  line: `"""app.py — Streamlit dashboard: Backtest | Paper Trading | Live
+  Trading."""`
+- `requirements.txt` already pins `streamlit` (line 6)
+- `notifications.py` already exposes `send_telegram()` reading
+  `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` from env
+- `trader.py` is a `class Trader:` library (no `__main__`), imported by
+  `app.py` and run as a daemon thread inside the Streamlit process
+- `broker.py` uses `pyotp.TOTP(totp_secret).now()` for Angel One login with
+  `SESSION_MAX_AGE_HOURS = 5` — no daily token rotation needed for live
+  trading; only the Dhan token rotates daily
