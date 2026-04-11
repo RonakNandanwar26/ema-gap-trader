@@ -23,6 +23,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -100,6 +101,23 @@ _STRIKE_OFFSETS = (
 # ---------------------------------------------------------------------------
 
 _DHAN_API_BASE = "https://api.dhan.co/v2"
+
+_DHAN_TOKEN_PATH = os.environ.get("DHAN_TOKEN_PATH", "/etc/ema-trader/dhan.token")
+
+
+def _get_dhan_token() -> str:
+    """Read the Dhan access token just-in-time.
+
+    The token is rotated daily by the user via the Streamlit sidebar widget
+    in app.py, which writes ``/etc/ema-trader/dhan.token``. Reading per call
+    means the next Dhan API request always picks up the fresh value with no
+    service restart. Falls back to ``DHAN_ACCESS_TOKEN`` env var when the
+    file is absent — used for local dev and pytest.
+    """
+    try:
+        return Path(_DHAN_TOKEN_PATH).read_text().strip()
+    except FileNotFoundError:
+        return os.environ.get("DHAN_ACCESS_TOKEN", "")
 
 
 def init_dhan() -> dict:
