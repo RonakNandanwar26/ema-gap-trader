@@ -26,39 +26,62 @@ def _load_spot_candles(conn: sqlite3.Connection, instrument: str, interval: int)
     return df
 
 
-def _get_option_premium(conn: sqlite3.Connection, timestamp, direction: str, instrument: str, expiry_flag: str):
-    """Get ATM option premium nearest to timestamp (±10 min). Returns (premium, strike) or (None, None)."""
-    ts = pd.Timestamp(timestamp)
+def _pick_expiry_code(entry_ts, expiry_weekday: int) -> int:
+    """Mirror live trader's `exp > today` rule: on the weekly expiry day,
+    today's contract is filtered out so the next-week contract (Dhan code=2)
+    is the one actually traded. On every other weekday the current rolling
+    weekly (code=1) is correct."""
+    return 2 if pd.Timestamp(entry_ts).weekday() == expiry_weekday else 1
+
+
+def _query_premium(conn, ts, direction, instrument, expiry_flag, expiry_code, target_strike=None):
     lo = (ts - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     hi = (ts + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     dhan_dir = "CALL" if direction == "CE" else "PUT"
-    cur = conn.execute(
-        "SELECT close, strike FROM dhan_option_candle "
-        "WHERE instrument=? AND strike_offset='ATM' AND direction=? "
-        "AND expiry_flag=? AND interval_min=5 "
-        "AND timestamp>=? AND timestamp<=? "
-        "ORDER BY ABS(julianday(timestamp)-julianday(?)) LIMIT 1",
-        (instrument, dhan_dir, expiry_flag, lo, hi, ts.strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    row = cur.fetchone()
+    if target_strike is None:
+        sql = (
+            "SELECT close, strike FROM dhan_option_candle "
+            "WHERE instrument=? AND strike_offset='ATM' AND direction=? "
+            "AND expiry_flag=? AND expiry_code=? AND interval_min=5 "
+            "AND timestamp>=? AND timestamp<=? "
+            "ORDER BY ABS(julianday(timestamp)-julianday(?)) LIMIT 1"
+        )
+        params = (instrument, dhan_dir, expiry_flag, expiry_code, lo, hi, ts.strftime("%Y-%m-%d %H:%M:%S"))
+    else:
+        sql = (
+            "SELECT close, strike FROM dhan_option_candle "
+            "WHERE instrument=? AND direction=? "
+            "AND expiry_flag=? AND expiry_code=? AND interval_min=5 "
+            "AND timestamp>=? AND timestamp<=? AND ABS(strike-?)<1 "
+            "ORDER BY ABS(julianday(timestamp)-julianday(?)) LIMIT 1"
+        )
+        params = (instrument, dhan_dir, expiry_flag, expiry_code, lo, hi, target_strike, ts.strftime("%Y-%m-%d %H:%M:%S"))
+    row = conn.execute(sql, params).fetchone()
+    return row
+
+
+def _get_option_premium(conn: sqlite3.Connection, timestamp, direction: str, instrument: str, expiry_flag: str, expiry_code: int):
+    """Get ATM option premium nearest to timestamp (±10 min). Returns (premium, strike) or (None, None).
+
+    Falls back to the other expiry_code if the requested one returns no rows,
+    so the backtest degrades gracefully while the code=2 cache is still being backfilled.
+    """
+    ts = pd.Timestamp(timestamp)
+    row = _query_premium(conn, ts, direction, instrument, expiry_flag, expiry_code)
+    if row is None:
+        fallback = 1 if expiry_code == 2 else 2
+        row = _query_premium(conn, ts, direction, instrument, expiry_flag, fallback)
     return (float(row[0]), float(row[1])) if row else (None, None)
 
 
-def _get_premium_by_strike(conn: sqlite3.Connection, timestamp, direction: str, instrument: str, expiry_flag: str, target_strike: float):
-    """Get option premium for a specific strike nearest to timestamp (±10 min)."""
+def _get_premium_by_strike(conn: sqlite3.Connection, timestamp, direction: str, instrument: str, expiry_flag: str, expiry_code: int, target_strike: float):
+    """Get option premium for a specific strike nearest to timestamp (±10 min).
+    Falls back to the other expiry_code on miss."""
     ts = pd.Timestamp(timestamp)
-    lo = (ts - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-    hi = (ts + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-    dhan_dir = "CALL" if direction == "CE" else "PUT"
-    cur = conn.execute(
-        "SELECT close FROM dhan_option_candle "
-        "WHERE instrument=? AND direction=? "
-        "AND expiry_flag=? AND interval_min=5 "
-        "AND timestamp>=? AND timestamp<=? AND ABS(strike-?)<1 "
-        "ORDER BY ABS(julianday(timestamp)-julianday(?)) LIMIT 1",
-        (instrument, dhan_dir, expiry_flag, lo, hi, target_strike, ts.strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    row = cur.fetchone()
+    row = _query_premium(conn, ts, direction, instrument, expiry_flag, expiry_code, target_strike)
+    if row is None:
+        fallback = 1 if expiry_code == 2 else 2
+        row = _query_premium(conn, ts, direction, instrument, expiry_flag, fallback, target_strike)
     return float(row[0]) if row else None
 
 
@@ -118,10 +141,11 @@ def run_backtest(
 
             if reason:
                 ep = None
+                trade_code = open_trade["expiry_code"]
                 if open_trade["strike"]:
-                    ep = _get_premium_by_strike(conn, ts, open_trade["dir"], ic.name, ic.expiry_flag, open_trade["strike"])
+                    ep = _get_premium_by_strike(conn, ts, open_trade["dir"], ic.name, ic.expiry_flag, trade_code, open_trade["strike"])
                 if ep is None:
-                    ep, _ = _get_option_premium(conn, ts, open_trade["dir"], ic.name, ic.expiry_flag)
+                    ep, _ = _get_option_premium(conn, ts, open_trade["dir"], ic.name, ic.expiry_flag, trade_code)
                 pp = (ep - open_trade["prem_in"]) * ic.lot_size if ep and open_trade["prem_in"] else None
 
                 trades.append({
@@ -161,10 +185,11 @@ def run_backtest(
         is_crossover = (direction == "CE" and crossover_up) or (direction == "PE" and crossover_down)
         entry_type = "crossover" if is_crossover else sc.extra_entry_mode
 
-        prem, strike = _get_option_premium(conn, ts, direction, ic.name, ic.expiry_flag)
+        entry_code = _pick_expiry_code(ts, ic.expiry_weekday)
+        prem, strike = _get_option_premium(conn, ts, direction, ic.name, ic.expiry_flag, entry_code)
         open_trade = {
             "ts": ts, "idx": i, "dir": direction, "spot_in": row["close"],
-            "prem_in": prem, "strike": strike,
+            "prem_in": prem, "strike": strike, "expiry_code": entry_code,
             "rsi": row["rsi"], "gap": row["ema_gap_pct"],
             "entry_type": entry_type,
         }
@@ -173,10 +198,11 @@ def run_backtest(
     if open_trade is not None and indices:
         last = df.iloc[indices[-1]]
         ep = None
+        trade_code = open_trade["expiry_code"]
         if open_trade["strike"]:
-            ep = _get_premium_by_strike(conn, last["timestamp"], open_trade["dir"], ic.name, ic.expiry_flag, open_trade["strike"])
+            ep = _get_premium_by_strike(conn, last["timestamp"], open_trade["dir"], ic.name, ic.expiry_flag, trade_code, open_trade["strike"])
         if ep is None:
-            ep, _ = _get_option_premium(conn, last["timestamp"], open_trade["dir"], ic.name, ic.expiry_flag)
+            ep, _ = _get_option_premium(conn, last["timestamp"], open_trade["dir"], ic.name, ic.expiry_flag, trade_code)
         pp = (ep - open_trade["prem_in"]) * ic.lot_size if ep and open_trade["prem_in"] else None
         trades.append({
             "entry": open_trade["ts"], "exit": last["timestamp"],

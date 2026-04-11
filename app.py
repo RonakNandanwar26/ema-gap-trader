@@ -22,6 +22,14 @@ import plotly.io as pio
 
 from backtester import run_backtest
 from config import StrategyConfig, InstrumentConfig, INSTRUMENTS, get_dhan_db_path, get_data_dir
+from dhan_data import (
+    _EXPIRY_FLAGS,
+    _get_cached_date_range,
+    _resolve_incremental_range,
+    fetch_index_intraday,
+    init_dhan,
+    prefetch_option_data,
+)
 from persistence import TradeStore
 from results import compute_stats, compute_equity_curve
 from trader import Trader
@@ -393,6 +401,74 @@ with tab_bt:
         start_date = st.date_input("Start Date", value=date(2023, 4, 1))
     with c2:
         end_date = st.date_input("End Date", value=date(2026, 3, 28))
+
+    # --- Dhan cache status & top-up ---
+    spot_min, spot_max = _get_cached_date_range(
+        instrument, "dhan_spot_candle",
+        candle_type="intraday", interval_min=candle_interval,
+    )
+    opt1_min, opt1_max = _get_cached_date_range(
+        instrument, "dhan_option_candle",
+        strike_offset="ATM", direction="CALL",
+        expiry_flag=_EXPIRY_FLAGS[instrument], expiry_code=1, interval_min=5,
+    )
+    opt2_min, opt2_max = _get_cached_date_range(
+        instrument, "dhan_option_candle",
+        strike_offset="ATM", direction="CALL",
+        expiry_flag=_EXPIRY_FLAGS[instrument], expiry_code=2, interval_min=5,
+    )
+
+    cache_col1, cache_col2, cache_col3 = st.columns(3)
+    cache_col1.caption(f"Spot {candle_interval}m: {spot_min or '—'} → {spot_max or '—'}")
+    cache_col2.caption(f"Options code=1 (current week): {opt1_min or '—'} → {opt1_max or '—'}")
+    cache_col3.caption(f"Options code=2 (next week): {opt2_min or '—'} → {opt2_max or '—'}")
+
+    req_from = str(start_date)
+    req_to = str(end_date)
+    spot_gap = _resolve_incremental_range(spot_min, spot_max, req_from, req_to)
+    opt1_gap = _resolve_incremental_range(opt1_min, opt1_max, req_from, req_to)
+    opt2_gap = _resolve_incremental_range(opt2_min, opt2_max, req_from, req_to)
+
+    if spot_gap is not None or opt1_gap is not None or opt2_gap is not None:
+        msg_parts = []
+        if spot_gap:
+            msg_parts.append(f"spot {spot_gap[0]}..{spot_gap[1]}")
+        if opt1_gap:
+            msg_parts.append(f"options code=1 {opt1_gap[0]}..{opt1_gap[1]}")
+        if opt2_gap:
+            msg_parts.append(f"options code=2 {opt2_gap[0]}..{opt2_gap[1]}")
+        st.warning("Cache is missing: " + "; ".join(msg_parts))
+
+        if st.button("Fetch Missing Data from Dhan"):
+            try:
+                creds = init_dhan()
+            except RuntimeError as e:
+                st.error(str(e))
+            else:
+                progress = st.progress(0, text="Starting Dhan fetch…")
+                if spot_gap is not None:
+                    progress.progress(5, text=f"Fetching spot {spot_gap[0]}..{spot_gap[1]}")
+                    fetch_index_intraday(
+                        creds, instrument, candle_interval,
+                        f"{spot_gap[0]} 09:15:00", f"{spot_gap[1]} 15:30:00",
+                    )
+                if opt1_gap is not None:
+                    progress.progress(20, text=f"Fetching options code=1 {opt1_gap[0]}..{opt1_gap[1]} (30 streams)")
+                    prefetch_option_data(
+                        creds, instrument, _EXPIRY_FLAGS[instrument], 5,
+                        opt1_gap[0], opt1_gap[1], expiry_codes=(1,),
+                    )
+                if opt2_gap is not None:
+                    progress.progress(60, text=f"Fetching options code=2 {opt2_gap[0]}..{opt2_gap[1]} (30 streams)")
+                    prefetch_option_data(
+                        creds, instrument, _EXPIRY_FLAGS[instrument], 5,
+                        opt2_gap[0], opt2_gap[1], expiry_codes=(2,),
+                    )
+                progress.progress(100, text="Done")
+                st.success("Cache updated. Click Run Backtest.")
+                st.rerun()
+    else:
+        st.success(f"Cache fully covers {req_from} → {req_to} (both expiry codes)")
 
     if st.button("Run Backtest", type="primary"):
         with st.spinner(f"Running backtest on {instrument}..."):
