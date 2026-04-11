@@ -81,8 +81,9 @@ class TickManager:
         with self._lock:
             # Track for resubscribe on reconnect
             self._subscriptions.append(sub)
+            connected = self._connected
 
-        if self._connected and self._sws:
+        if connected and self._sws:
             try:
                 self._sws.subscribe(f"sub_{token}", 1, [sub])  # LTP_MODE = 1
                 logger.info("Subscribed to token %s (exchange %d)", token, exchange_type)
@@ -97,8 +98,9 @@ class TickManager:
                                    if not (s["exchangeType"] == exchange_type and token in s["tokens"])]
             self._ltp_cache.pop(token, None)
             self._last_update.pop(token, None)
+            connected = self._connected
 
-        if self._connected and self._sws:
+        if connected and self._sws:
             try:
                 self._sws.unsubscribe(f"unsub_{token}", 1, [sub])
             except Exception:

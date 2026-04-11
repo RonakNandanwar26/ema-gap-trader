@@ -36,6 +36,8 @@ def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3
     # SuperTrend computation
     st, direction = [None] * n, [0] * n
     first = period - 1
+    if first >= n:
+        return pd.Series(st, index=df.index), pd.Series(direction, index=df.index)
     st[first] = upper[first]
     direction[first] = -1
 
@@ -83,14 +85,17 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["st"], df["st_dir"] = compute_supertrend(df)
 
     # EMA Gap %
-    df["ema_gap_pct"] = (df["ema9"] - df["ema21"]).abs() / df["ema21"] * 100
+    df["ema_gap_pct"] = (df["ema9"] - df["ema21"]).abs() / df["ema21"].replace(0, np.nan) * 100
+    df["ema_gap_pct"] = df["ema_gap_pct"].fillna(0)
     df["ema_gap_expanding"] = df["ema_gap_pct"] > df["ema_gap_pct"].shift(1)
 
     # RSI(14)
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss_s = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss_s
+    loss_s = delta.where(delta < 0, 0).abs().rolling(14).mean()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = gain / loss_s
     df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
 
     return df
