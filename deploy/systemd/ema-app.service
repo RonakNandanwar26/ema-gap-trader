@@ -1,0 +1,33 @@
+[Unit]
+Description=ema-gap-trader Streamlit app (backtest + paper + live trading)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ema-gap-trader
+EnvironmentFile=/etc/ema-trader/app.env
+Environment=DHAN_TOKEN_PATH=/etc/ema-trader/dhan.token
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ema-gap-trader/.venv/bin/streamlit run app.py \
+    --server.address=127.0.0.1 \
+    --server.port=8501 \
+    --server.headless=true \
+    --browser.gatherUsageStats=false
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ema-app
+
+# Security hardening — minimal but useful
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ema-gap-trader /etc/ema-trader
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
