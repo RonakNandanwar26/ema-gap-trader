@@ -67,7 +67,12 @@ class Trader:
 
         # Login + scrip master
         logger.info("Logging in to SmartAPI...")
-        broker.login()
+        try:
+            broker.login()
+        except Exception as exc:
+            tag = f"[{self._label}] " if self._label else ""
+            send_telegram(f"{tag}Angel One login failed: {exc}")
+            raise
         logger.info("Loading scrip master...")
         self._scrip_master = broker.load_scrip_master()
         today = date.today()
@@ -289,6 +294,8 @@ class Trader:
             })
             if order_id is None:
                 logger.error("Order placement failed, skipping entry")
+                tag = f"[{self._label}] " if self._label else ""
+                send_telegram(f"{tag}Order failed (ENTRY): {direction} {symbol} @ Rs.{premium:.1f}")
                 return
             fill = broker.verify_order(order_id)
             if fill and fill.get("averageprice"):
@@ -355,6 +362,10 @@ class Trader:
                 fill = broker.verify_order(order_id)
                 if fill and fill.get("averageprice"):
                     exit_premium = float(fill["averageprice"])
+            else:
+                logger.error("Order placement failed on EXIT for %s", trade["symbol"])
+                tag = f"[{self._label}] " if self._label else ""
+                send_telegram(f"{tag}Order failed (EXIT): {trade['dir']} {trade['symbol']}")
 
         pnl = None
         if exit_premium and trade["entry_price"]:
