@@ -42,6 +42,34 @@ from trader import Trader
 st.set_page_config(page_title="EMA Gap Trader", page_icon=":chart_with_upwards_trend:", layout="wide")
 
 # ---------------------------------------------------------------------------
+# Dhan token sidebar widget — daily JWT rotation without service restart
+# ---------------------------------------------------------------------------
+from pathlib import Path as _DhanPath
+
+_DHAN_TOKEN_FILE = _DhanPath(os.environ.get("DHAN_TOKEN_PATH", "/etc/ema-trader/dhan.token"))
+
+with st.sidebar.expander("Dhan token (daily refresh)", expanded=False):
+    if _DHAN_TOKEN_FILE.exists() and _DHAN_TOKEN_FILE.read_text().strip():
+        st.caption(f"Status: SET ({_DHAN_TOKEN_FILE})")
+    else:
+        st.caption(f"Status: MISSING ({_DHAN_TOKEN_FILE})")
+    _new_dhan_token = st.text_input(
+        "Paste new Dhan access token",
+        type="password",
+        key="dhan_token_input",
+    )
+    if st.button("Save token", key="dhan_token_save"):
+        if not _new_dhan_token.strip():
+            st.error("Empty token — not saved.")
+        else:
+            try:
+                _DHAN_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _DHAN_TOKEN_FILE.write_text(_new_dhan_token.strip())
+                st.success("Saved. Next Dhan call will use it.")
+            except PermissionError as exc:
+                st.error(f"Permission denied writing {_DHAN_TOKEN_FILE}: {exc}")
+
+# ---------------------------------------------------------------------------
 # Trading session wrapper (runs Trader in daemon thread)
 # ---------------------------------------------------------------------------
 
