@@ -11,6 +11,9 @@ WorkingDirectory=/opt/ema-gap-trader
 EnvironmentFile=/etc/ema-trader/app.env
 Environment=DHAN_TOKEN_PATH=/etc/ema-trader/dhan.token
 Environment=PYTHONUNBUFFERED=1
+# HOME override so Streamlit writes its config under /opt/ema-gap-trader/.streamlit
+# instead of /home/ubuntu/.streamlit (blocked by ProtectHome=true)
+Environment=HOME=/opt/ema-gap-trader
 ExecStart=/opt/ema-gap-trader/.venv/bin/streamlit run app.py \
     --server.address=127.0.0.1 \
     --server.port=8501 \
