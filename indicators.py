@@ -75,14 +75,20 @@ def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3
     return pd.Series(st, index=df.index), pd.Series(direction, index=df.index)
 
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    ema_short: int = 9,
+    ema_long: int = 21,
+    st_period: int = 10,
+    st_multiplier: float = 3.0,
+) -> pd.DataFrame:
     """Add all indicator columns: ema9, ema21, st, st_dir, ema_gap_pct, ema_gap_expanding, rsi."""
-    # EMA 9/21
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    # EMA short/long (columns keep names ema9/ema21 for strategy.py compatibility)
+    df["ema9"] = df["close"].ewm(span=ema_short, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=ema_long, adjust=False).mean()
 
     # SuperTrend
-    df["st"], df["st_dir"] = compute_supertrend(df)
+    df["st"], df["st_dir"] = compute_supertrend(df, period=st_period, multiplier=st_multiplier)
 
     # EMA Gap %
     df["ema_gap_pct"] = (df["ema9"] - df["ema21"]).abs() / df["ema21"].replace(0, np.nan) * 100

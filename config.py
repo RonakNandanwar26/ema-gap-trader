@@ -25,6 +25,11 @@ class StrategyConfig:
     max_capital_per_trade_pct: float  # e.g. 0.25 = 25% of equity
     orb_filter: bool  # require price to break ORB range before entry
     ema_gap_floor: float = 0.0  # exit if ema_gap_pct drops below this after 2+ candles; 0 disables
+    ema_short: int = 9           # short EMA span (default 9)
+    ema_long: int = 21           # long EMA span (default 21)
+    st_period: int = 10          # SuperTrend ATR period
+    st_multiplier: float = 3.0   # SuperTrend multiplier
+    orb_window_minutes: int = 30  # ORB range window from 9:15 (default 30 = 9:45)
 
 
 @dataclass

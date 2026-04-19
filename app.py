@@ -351,6 +351,8 @@ if "live_sessions" not in st.session_state:
     st.session_state.live_sessions = {}   # instrument_name -> TradingSession
 if "live_confirmed" not in st.session_state:
     st.session_state.live_confirmed = False
+if "opt_sessions" not in st.session_state:
+    st.session_state.opt_sessions = {}  # instrument_name -> TradingSession (optimized)
 
 # ---------------------------------------------------------------------------
 # Sidebar — configurable params
@@ -466,7 +468,7 @@ ic = _get_ic(instrument)
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_bt, tab_paper, tab_live = st.tabs(["Backtest", "Paper Trading", "Live Trading"])
+tab_bt, tab_paper, tab_opt, tab_live = st.tabs(["Backtest", "Paper Trading", "Optimized Paper", "Live Trading"])
 
 # ---------------------------------------------------------------------------
 # Tab 1: Backtest
@@ -790,7 +792,71 @@ with tab_paper:
 
 
 # ---------------------------------------------------------------------------
-# Tab 3: Live Trading
+# Tab 3: Optimized Paper Trading (NIFTY intraday)
+# ---------------------------------------------------------------------------
+
+with tab_opt:
+    st.header("Optimized Paper Trading")
+    st.markdown(
+        "**Config:** EMA 5/13 | ST 10/2.0 | gap_floor=0.10 | max_hold=15 | "
+        "cooldown=2 | gap_min=0 | ORB 45min | Intraday"
+    )
+    st.caption("Research-optimized params: +46% P&L, +35% PF, +6% WR vs current system (backtest 2023-2026)")
+
+    # Build the optimized StrategyConfig (hardcoded — isolated from sidebar)
+    opt_sc = StrategyConfig(
+        extra_entry_mode="midtrend",
+        ema_gap_min=0,
+        max_hold_candles=15,
+        cooldown_candles=2,
+        candle_interval=15,
+        max_capital_per_trade_pct=0.25,
+        orb_filter=True,
+        ema_gap_floor=0.10,
+        ema_short=5,
+        ema_long=13,
+        st_period=10,
+        st_multiplier=2.0,
+        orb_window_minutes=45,
+    )
+
+    OPT_INST = "NIFTY"
+    opt_ic = _get_ic(OPT_INST)
+    opt_session = st.session_state.opt_sessions.get(OPT_INST)
+    opt_store = TradeStore(f"{OPT_INST}-optimized", "paper", get_data_dir())
+    opt_running = opt_session is not None and opt_session.is_running
+
+    # Recovery warning
+    if not opt_running:
+        open_trade = opt_store.load_open_trade()
+        if open_trade:
+            st.warning(
+                f"Unclosed position from previous session: "
+                f"{open_trade.get('dir')} {open_trade.get('symbol', '?')} "
+                f"@ Rs.{open_trade.get('entry_price', 0):.1f}. "
+                f"Start the session to auto-recover."
+            )
+
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("Start NIFTY Optimized", key="start_opt_nifty", type="primary", disabled=opt_running):
+            old = st.session_state.opt_sessions.get(OPT_INST)
+            if old is not None:
+                old.stop()
+            s = TradingSession(opt_sc, opt_ic, capital, live=False, variant="optimized")
+            s.start()
+            st.session_state.opt_sessions[OPT_INST] = s
+            st.rerun()
+        if st.button("Stop NIFTY Optimized", key="stop_opt_nifty", disabled=not opt_running):
+            if opt_session:
+                opt_session.stop()
+                st.rerun()
+    with col1:
+        _render_trading_panel(opt_session, f"optimized paper {OPT_INST}", store=opt_store)
+
+
+# ---------------------------------------------------------------------------
+# Tab 4: Live Trading
 # ---------------------------------------------------------------------------
 
 with tab_live:
@@ -886,6 +952,7 @@ with tab_live:
 
 any_running = (
     any(s.is_running for s in st.session_state.paper_sessions.values())
+    or any(s.is_running for s in st.session_state.opt_sessions.values())
     or any(s.is_running for s in st.session_state.live_sessions.values())
 )
 if any_running:

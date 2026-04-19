@@ -102,7 +102,7 @@ def run_backtest(
 
     conn = _get_conn(db)
     df = _load_spot_candles(conn, ic.name, sc.candle_interval)
-    df = compute_indicators(df)
+    df = compute_indicators(df, sc.ema_short, sc.ema_long, sc.st_period, sc.st_multiplier)
 
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
@@ -110,14 +110,15 @@ def run_backtest(
         end_ts = end_ts + pd.Timedelta(hours=23, minutes=59, seconds=59)
     indices = df.index[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)].tolist()
 
-    # Precompute ORB (opening range) per day: high/low of first 30 min
+    # Precompute ORB (opening range) per day
     orb_ranges: dict = {}
     if sc.orb_filter:
         from datetime import time as _t
+        _orb_end = _t(9, min(15 + sc.orb_window_minutes, 59))
         df["_date"] = df["timestamp"].dt.date
         df["_time"] = df["timestamp"].dt.time
         for d, grp in df.groupby("_date"):
-            first_30 = grp[(grp["_time"] >= _t(9, 15)) & (grp["_time"] <= _t(9, 30))]
+            first_30 = grp[(grp["_time"] >= _t(9, 15)) & (grp["_time"] <= _orb_end)]
             if len(first_30) >= 2:
                 orb_ranges[d] = (first_30["high"].max(), first_30["low"].min())
         df.drop(columns=["_date", "_time"], inplace=True)
@@ -174,7 +175,7 @@ def run_backtest(
         orb = orb_ranges.get(ts.date())
         # Don't pass ORB for candles within the opening range itself
         from datetime import time as _t2
-        orb_h, orb_l = orb if (orb and ts.time() > _t2(9, 30)) else (None, None)
+        orb_h, orb_l = orb if (orb and ts.time() > _t2(9, min(15 + sc.orb_window_minutes, 59))) else (None, None)
         direction = check_entry(row, prev, sc.extra_entry_mode, sc.ema_gap_min, last_exit_idx, i, sc.cooldown_candles, orb_h, orb_l, sc.orb_filter)
         if direction is None:
             continue

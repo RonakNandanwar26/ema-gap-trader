@@ -153,17 +153,19 @@ class Trader:
                 send_telegram(f"No fresh candles for {today}. Market appears closed. Stopping.")
                 break
 
-            df = compute_indicators(df)
+            df = compute_indicators(df, self.sc.ema_short, self.sc.ema_long,
+                                    self.sc.st_period, self.sc.st_multiplier)
             self._last_df = df  # cache for virtual close checks
             idx = len(df) - 1
             row = df.iloc[idx]
             prev = df.iloc[idx - 1] if idx > 0 else None
             candle_count += 1
 
-            # Compute ORB range from first 30 min of today
+            # Compute ORB range from configurable window
             if self.sc.orb_filter and self._orb_high is None:
                 today_df = df[df["timestamp"].dt.date == today]
-                first_30 = today_df[today_df["timestamp"].dt.time <= time(9, 30)]
+                _orb_end = time(9, min(15 + self.sc.orb_window_minutes, 59))
+                first_30 = today_df[today_df["timestamp"].dt.time <= _orb_end]
                 if len(first_30) >= 2:
                     self._orb_high = float(first_30["high"].max())
                     self._orb_low = float(first_30["low"].min())
@@ -442,7 +444,8 @@ class Trader:
 
         # Recompute indicators on extended DataFrame
         try:
-            virtual_df = compute_indicators(virtual_df)
+            virtual_df = compute_indicators(virtual_df, self.sc.ema_short, self.sc.ema_long,
+                                           self.sc.st_period, self.sc.st_multiplier)
         except Exception:
             logger.debug("compute_indicators failed on virtual candle, skipping check")
             return None
