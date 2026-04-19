@@ -9,3 +9,5 @@ python-telegram-bot
 requests
 logzero
 websocket-client
+fastapi
+uvicorn[standard]

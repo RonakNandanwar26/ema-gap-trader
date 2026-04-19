@@ -1,0 +1,39 @@
+[Unit]
+Description=ema-gap-trader trading daemon (owns all Trader threads, FastAPI control plane on 127.0.0.1:8787)
+After=network-online.target
+Wants=network-online.target
+# Prevent a crash loop from DoS-ing Angel One's login endpoint.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ema-gap-trader
+EnvironmentFile=/etc/ema-trader/app.env
+Environment=DHAN_TOKEN_PATH=/etc/ema-trader/dhan.token
+Environment=PYTHONUNBUFFERED=1
+# HOME override: Trader/broker/notification libs occasionally touch $HOME (e.g.
+# smartapi-python logs, matplotlib cache). Point it at the app dir so
+# ProtectHome=true doesn't cause write failures.
+Environment=HOME=/opt/ema-gap-trader
+ExecStart=/opt/ema-gap-trader/.venv/bin/python -m trader_daemon
+Restart=always
+RestartSec=5
+# Give the lifespan shutdown handler time to stop all Trader threads
+# (thread.join(timeout=5) per Trader, plus buffer).
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ema-trader-daemon
+
+# Security hardening — mirrors ema-app.service
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ema-gap-trader /etc/ema-trader
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

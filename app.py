@@ -32,6 +32,7 @@ from dhan_data import (
     prefetch_option_data,
 )
 from persistence import TradeStore
+from remote_session import RemoteSession, daemon_is_reachable
 from results import compute_stats, compute_equity_curve
 from trader import Trader
 
@@ -40,6 +41,22 @@ from trader import Trader
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="EMA Gap Trader", page_icon=":chart_with_upwards_trend:", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Trader mode: "local" (legacy, in-process daemon thread) or "remote" (FastAPI
+# daemon at TRADER_DAEMON_URL). The feature flag lets us roll back instantly.
+# ---------------------------------------------------------------------------
+USE_DAEMON = os.environ.get("TRADER_DAEMON_MODE", "local") == "remote"
+TRADER_DAEMON_URL = os.environ.get("TRADER_DAEMON_URL", "http://127.0.0.1:8787")
+
+if USE_DAEMON and not daemon_is_reachable(TRADER_DAEMON_URL):
+    st.error(
+        f"⚠️ Trader daemon unreachable at {TRADER_DAEMON_URL}. "
+        f"Paper/Live/Optimized tabs will not work until it is back up.\n\n"
+        f"On EC2: `sudo systemctl status ema-trader-daemon` "
+        f"(see logs via `sudo journalctl -u ema-trader-daemon -n 50`).\n\n"
+        f"Backtest tab remains usable."
+    )
 
 # ---------------------------------------------------------------------------
 # Dhan token sidebar widget — daily JWT rotation without service restart
@@ -154,6 +171,14 @@ class TradingSession:
         except Exception:
             self._error = traceback.format_exc()
             logging.exception("Trading session crashed")
+
+
+# ---------------------------------------------------------------------------
+# Session factory — picks RemoteSession in remote mode, TradingSession locally.
+# Both expose: start(), stop(), is_running (property), get_status() → TradingStatus.
+# ---------------------------------------------------------------------------
+
+_SessionFactory = RemoteSession if USE_DAEMON else TradingSession
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +747,7 @@ with tab_paper:
                     if old is not None:
                         old.stop()
                     inst_ic = _get_ic(inst_name)
-                    session = TradingSession(sc, inst_ic, capital, live=False)
+                    session = _SessionFactory(sc, inst_ic, capital, live=False)
                     session.start()
                     st.session_state.paper_sessions[inst_name] = session
             st.rerun()
@@ -775,7 +800,7 @@ with tab_paper:
                         old = st.session_state.paper_sessions.get(session_key)
                         if old is not None:
                             old.stop()
-                        s = TradingSession(
+                        s = _SessionFactory(
                             _sc_for_variant(variant), _get_ic(inst_name), capital,
                             live=False, variant=variant,
                         )
@@ -843,7 +868,7 @@ with tab_opt:
             old = st.session_state.opt_sessions.get(OPT_INST)
             if old is not None:
                 old.stop()
-            s = TradingSession(opt_sc, opt_ic, capital, live=False, variant="optimized")
+            s = _SessionFactory(opt_sc, opt_ic, capital, live=False, variant="optimized")
             s.start()
             st.session_state.opt_sessions[OPT_INST] = s
             st.rerun()
@@ -892,7 +917,7 @@ with tab_live:
                         if old is not None:
                             old.stop()
                         inst_ic = _get_ic(inst_name)
-                        session = TradingSession(sc, inst_ic, capital, live=True)
+                        session = _SessionFactory(sc, inst_ic, capital, live=True)
                         session.start()
                         st.session_state.live_sessions[inst_name] = session
                 st.rerun()
@@ -935,7 +960,7 @@ with tab_live:
                         old = st.session_state.live_sessions.get(inst_name)
                         if old is not None:
                             old.stop()
-                        s = TradingSession(sc, _get_ic(inst_name), capital, live=True)
+                        s = _SessionFactory(sc, _get_ic(inst_name), capital, live=True)
                         s.start()
                         st.session_state.live_sessions[inst_name] = s
                         st.rerun()
