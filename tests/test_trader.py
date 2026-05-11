@@ -667,3 +667,188 @@ class TestIntradayForceExit:
         assert t._should_exit_loop(dtime(15, 9, 59)) is False
         assert t._should_exit_loop(dtime(15, 10)) is True
         assert t._should_exit_loop(dtime(15, 30)) is True
+
+    # ---- Integration: drive run() end-to-end with a mocked clock ----
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    @patch("trader.WS_ENABLED", False)
+    def test_run_force_exits_open_trade_at_time_exit(
+        self, mock_broker, mock_tg,
+        sample_strategy_config, sample_instrument_config,
+    ):
+        """Loop guard at TIME_EXIT must break run() and force-close any open trade."""
+        from datetime import datetime as real_dt, date as real_date
+
+        class FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 5, 11, 15, 11, 0)
+
+        mock_broker.login.return_value = None
+        mock_broker.load_scrip_master.return_value = {}
+        mock_broker.get_current_expiry.return_value = real_date(2026, 5, 13)
+        mock_broker.fetch_ltp.return_value = 200.0
+
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = _make_open_trade(entry_price=150.0, quantity=65)
+        t._wait_until = MagicMock()
+        t._is_market_open_today = MagicMock(return_value=True)
+
+        with patch("trader.datetime", FakeDT):
+            t.run()
+
+        assert t.open_trade is None, "force-exit must close the open trade"
+        assert len(t.trades) == 1
+        assert t.trades[0]["reason"] == "time_exit"
+        assert t.trades[0]["prem_pnl"] == pytest.approx((200.0 - 150.0) * 65)
+        # Verify the old carry-forward telegram never went out
+        all_tg_calls = " ".join(str(c) for c in mock_tg.call_args_list)
+        assert "CARRY FORWARD" not in all_tg_calls
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    @patch("trader.WS_ENABLED", False)
+    def test_run_no_op_at_time_exit_when_no_open_trade(
+        self, mock_broker, mock_tg,
+        sample_strategy_config, sample_instrument_config,
+    ):
+        """Loop exit at TIME_EXIT with no open trade is a clean no-op (no trades, no exceptions)."""
+        from datetime import datetime as real_dt, date as real_date
+
+        class FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 5, 11, 15, 11, 0)
+
+        mock_broker.login.return_value = None
+        mock_broker.load_scrip_master.return_value = {}
+        mock_broker.get_current_expiry.return_value = real_date(2026, 5, 13)
+
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = None
+        t._wait_until = MagicMock()
+        t._is_market_open_today = MagicMock(return_value=True)
+
+        with patch("trader.datetime", FakeDT):
+            t.run()  # must not raise
+
+        assert t.open_trade is None
+        assert t.trades == []
+
+    @patch("trader.check_entry")
+    @patch("trader.compute_indicators")
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    @patch("trader.WS_ENABLED", False)
+    def test_run_blocks_entries_after_no_entry_cutoff(
+        self, mock_broker, mock_tg, mock_ci, mock_check_entry,
+        sample_strategy_config, sample_instrument_config, sample_ohlcv_df,
+    ):
+        """When current time >= NO_ENTRY_AFTER, check_entry() must NOT be called."""
+        from datetime import datetime as real_dt, date as real_date
+
+        # Shared mutable clock — iter 1 at 14:56, then advances past TIME_EXIT to break the loop
+        clock = {"now": real_dt(2026, 5, 11, 14, 56, 0)}
+
+        class FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return clock["now"]
+
+        mock_broker.login.return_value = None
+        mock_broker.load_scrip_master.return_value = {}
+        mock_broker.get_current_expiry.return_value = real_date(2026, 5, 13)
+
+        # Build a DF that has all indicator columns compute_indicators would add
+        from datetime import date as real_date2
+        base = sample_ohlcv_df(n=20)
+        # Force timestamps onto today (= real date.today()) so the
+        # "no fresh candles" guard in run() doesn't short-circuit the loop.
+        today_real = real_date2.today()
+        base["timestamp"] = pd.date_range(
+            pd.Timestamp(today_real) + pd.Timedelta(hours=9, minutes=15),
+            periods=len(base), freq="15min",
+        )
+        base["ema9"] = 21500.0
+        base["ema21"] = 21495.0
+        base["ema_gap_pct"] = 0.05
+        base["ema_gap_expanding"] = True
+        base["st_dir"] = 1
+        base["rsi"] = 55.0
+        mock_ci.return_value = base
+        mock_broker.fetch_candles.return_value = base
+        mock_check_entry.return_value = None  # in case it's somehow called
+
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = None
+        t._wait_until = MagicMock()
+        t._is_market_open_today = MagicMock(return_value=True)
+
+        # Advance the clock past TIME_EXIT after one iteration so the loop exits cleanly
+        def advance_clock(_candle_count):
+            clock["now"] = real_dt(2026, 5, 11, 15, 11, 0)
+        t._sleep_with_exit_monitoring = advance_clock
+
+        with patch("trader.datetime", FakeDT):
+            t.run()
+
+        # The critical assertion: check_entry must NOT have been called when now >= 14:55
+        mock_check_entry.assert_not_called()
+
+    @patch("trader.check_entry")
+    @patch("trader.compute_indicators")
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    @patch("trader.WS_ENABLED", False)
+    def test_run_allows_entries_before_no_entry_cutoff(
+        self, mock_broker, mock_tg, mock_ci, mock_check_entry,
+        sample_strategy_config, sample_instrument_config, sample_ohlcv_df,
+    ):
+        """Sanity: when current time < NO_ENTRY_AFTER, check_entry() IS called."""
+        from datetime import datetime as real_dt, date as real_date
+
+        clock = {"now": real_dt(2026, 5, 11, 10, 30, 0)}
+
+        class FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return clock["now"]
+
+        mock_broker.login.return_value = None
+        mock_broker.load_scrip_master.return_value = {}
+        mock_broker.get_current_expiry.return_value = real_date(2026, 5, 13)
+
+        from datetime import date as real_date2
+        base = sample_ohlcv_df(n=20)
+        # Force timestamps onto today (= real date.today()) so the
+        # "no fresh candles" guard in run() doesn't short-circuit the loop.
+        today_real = real_date2.today()
+        base["timestamp"] = pd.date_range(
+            pd.Timestamp(today_real) + pd.Timedelta(hours=9, minutes=15),
+            periods=len(base), freq="15min",
+        )
+        base["ema9"] = 21500.0
+        base["ema21"] = 21495.0
+        base["ema_gap_pct"] = 0.05
+        base["ema_gap_expanding"] = True
+        base["st_dir"] = 1
+        base["rsi"] = 55.0
+        mock_ci.return_value = base
+        mock_broker.fetch_candles.return_value = base
+        mock_check_entry.return_value = None
+
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = None
+        t._wait_until = MagicMock()
+        t._is_market_open_today = MagicMock(return_value=True)
+
+        def advance_clock(_candle_count):
+            clock["now"] = real_dt(2026, 5, 11, 15, 11, 0)
+        t._sleep_with_exit_monitoring = advance_clock
+
+        with patch("trader.datetime", FakeDT):
+            t.run()
+
+        # The complementary assertion: check_entry IS called when now < 14:55
+        mock_check_entry.assert_called()
