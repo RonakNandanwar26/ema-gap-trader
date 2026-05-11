@@ -69,6 +69,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
 
 MARKET_OPEN = time(9, 15)
 TRADING_START = time(9, 17)
+NO_ENTRY_AFTER = time(14, 55)
 TIME_EXIT = time(15, 10)
 MARKET_CLOSE = time(15, 30)
 

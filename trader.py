@@ -10,7 +10,7 @@ import pandas as pd
 
 import broker
 from config import (
-    MARKET_CLOSE, MARKET_OPEN, TRADING_START,
+    MARKET_CLOSE, MARKET_OPEN, NO_ENTRY_AFTER, TIME_EXIT, TRADING_START,
     WS_ENABLED, WS_EXIT_CHECK_INTERVAL,
     StrategyConfig, InstrumentConfig, get_instrument_config, get_strategy_config, get_capital,
 )
@@ -132,7 +132,7 @@ class Trader:
         candle_count = 0
         while self.running:
             now = datetime.now()
-            if now.time() >= MARKET_CLOSE:
+            if self._should_exit_loop(now.time()):
                 break
 
             if now.time() < TRADING_START:
@@ -202,8 +202,8 @@ class Trader:
                             self.open_trade["entry_price"], opt_ltp, pct, candles_held,
                         )
 
-            # Entry check
-            if self.open_trade is None and prev is not None:
+            # Entry check (blocked in final ~15 min so positions have time to develop before 15:10 force-exit)
+            if self.open_trade is None and prev is not None and not self._should_block_new_entry(now.time()):
                 direction = check_entry(
                     row, prev, self.sc.extra_entry_mode, self.sc.ema_gap_min,
                     self._last_exit_idx, candle_count, self.sc.cooldown_candles,
@@ -220,17 +220,8 @@ class Trader:
                 self._ws_exited_this_candle = False
                 continue
 
-        # End of day — carry forward open position
-        if self.open_trade is not None:
-            logger.info("Market close — carrying forward open position: %s %s",
-                        self.open_trade["dir"], self.open_trade.get("symbol"))
-            tag = f"[{self._label}] " if self._label else ""
-            send_telegram(
-                f"{tag}CARRY FORWARD\n"
-                f"{self.open_trade['dir']} {self.open_trade.get('symbol', '')}\n"
-                f"Entry: Rs.{self.open_trade.get('entry_price', 0):.1f}\n"
-                f"Position will resume next trading day."
-            )
+        # Intraday force-exit at TIME_EXIT — no carry-forward.
+        self._force_exit_position("time_exit")
 
         # Cleanup WebSocket
         if self._tick_manager:
@@ -529,6 +520,24 @@ class Trader:
             if now >= target:
                 return
             time_mod.sleep(2)  # short sleep so stop() is responsive
+
+    # ------------------------------------------------------------------
+    # Intraday force-exit helpers
+    # ------------------------------------------------------------------
+
+    def _should_exit_loop(self, now_t: time) -> bool:
+        return now_t >= TIME_EXIT
+
+    def _should_block_new_entry(self, now_t: time) -> bool:
+        return now_t >= NO_ENTRY_AFTER
+
+    def _force_exit_position(self, reason: str) -> None:
+        """Square off the open position (if any) at LTP — no carry-forward."""
+        if self.open_trade is None:
+            return
+        last_row = self._last_df.iloc[-1] if self._last_df is not None and not self._last_df.empty else None
+        logger.info("Force-exit at %s: %s %s", reason, self.open_trade["dir"], self.open_trade.get("symbol"))
+        self._process_exit(reason, last_row)
 
     # ------------------------------------------------------------------
     # Recovery from previous session

@@ -577,3 +577,93 @@ class TestCheckVirtualExit:
 
         result = t._check_virtual_exit(candle_count=10)
         assert result is None
+
+
+# ===========================================================================
+# TestIntradayForceExit
+# ===========================================================================
+
+class TestIntradayForceExit:
+    """Tests for intraday force-exit / no-carry-forward behavior."""
+
+    def test_config_constants(self):
+        """Force-exit times must be wired to 14:55 / 15:10."""
+        from datetime import time as dtime
+        from config import NO_ENTRY_AFTER, TIME_EXIT, MARKET_CLOSE
+        assert NO_ENTRY_AFTER == dtime(14, 55)
+        assert TIME_EXIT == dtime(15, 10)
+        assert TIME_EXIT < MARKET_CLOSE  # exit before close
+
+    def test_trader_imports_time_constants(self):
+        """trader.py must import TIME_EXIT and NO_ENTRY_AFTER."""
+        import trader as trader_mod
+        assert hasattr(trader_mod, "TIME_EXIT")
+        assert hasattr(trader_mod, "NO_ENTRY_AFTER")
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_force_exit_closes_open_trade(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        """_force_exit_position closes the open trade with reason 'time_exit'."""
+        mock_broker.fetch_ltp.return_value = 170.0
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = _make_open_trade(entry_price=150.0, quantity=65)
+        t._last_df = pd.DataFrame([_make_row().to_dict()])
+
+        t._force_exit_position("time_exit")
+
+        assert t.open_trade is None
+        assert len(t.trades) == 1
+        assert t.trades[0]["reason"] == "time_exit"
+        assert t.trades[0]["prem_pnl"] == pytest.approx((170.0 - 150.0) * 65)
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_force_exit_noop_when_no_open_trade(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        """_force_exit_position is a no-op when no trade is open."""
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = None
+        t._last_df = None
+
+        t._force_exit_position("time_exit")  # should not raise
+
+        assert t.open_trade is None
+        assert t.trades == []
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_force_exit_works_without_cached_df(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        """If _last_df is None, force-exit still closes (spot_out becomes None)."""
+        mock_broker.fetch_ltp.return_value = 160.0
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t.open_trade = _make_open_trade(entry_price=150.0, quantity=65)
+        t._last_df = None
+
+        t._force_exit_position("time_exit")
+
+        assert t.open_trade is None
+        assert len(t.trades) == 1
+        assert t.trades[0]["reason"] == "time_exit"
+        assert t.trades[0]["spot_out"] is None
+
+    def test_should_block_new_entry_before_cutoff(self, sample_strategy_config, sample_instrument_config):
+        """Entries allowed before NO_ENTRY_AFTER."""
+        from datetime import time as dtime
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        assert t._should_block_new_entry(dtime(9, 30)) is False
+        assert t._should_block_new_entry(dtime(14, 54, 59)) is False
+
+    def test_should_block_new_entry_at_or_after_cutoff(self, sample_strategy_config, sample_instrument_config):
+        """Entries blocked at and after NO_ENTRY_AFTER."""
+        from datetime import time as dtime
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        assert t._should_block_new_entry(dtime(14, 55)) is True
+        assert t._should_block_new_entry(dtime(14, 56)) is True
+        assert t._should_block_new_entry(dtime(15, 9)) is True
+
+    def test_should_exit_loop_predicate(self, sample_strategy_config, sample_instrument_config):
+        """Loop must exit at or after TIME_EXIT (15:10)."""
+        from datetime import time as dtime
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        assert t._should_exit_loop(dtime(15, 9, 59)) is False
+        assert t._should_exit_loop(dtime(15, 10)) is True
+        assert t._should_exit_loop(dtime(15, 30)) is True
