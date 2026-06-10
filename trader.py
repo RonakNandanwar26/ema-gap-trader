@@ -17,7 +17,7 @@ from config import (
 from indicators import compute_indicators
 from notifications import send_telegram
 from persistence import TradeStore
-from strategy import check_entry, check_exit
+from strategy import check_entry, check_exit, entry_premium_ok, eod_exit_due
 from tick_manager import TickManager, EXCHANGE_NSE_CM, EXCHANGE_NSE_FO, EXCHANGE_BSE_FO
 
 logger = logging.getLogger(__name__)
@@ -220,8 +220,9 @@ class Trader:
                 self._ws_exited_this_candle = False
                 continue
 
-        # Intraday force-exit at TIME_EXIT — no carry-forward.
-        self._force_exit_position("time_exit")
+        # End-of-day carry decision at TIME_EXIT (exit_all = intraday,
+        # exit_losers = sleep mode: carry winners overnight, close losers).
+        self._handle_eod()
 
         # Cleanup WebSocket
         if self._tick_manager:
@@ -276,6 +277,13 @@ class Trader:
 
         if strike != atm_strike:
             logger.info("Moved to OTM strike %d (ATM was %d) to fit budget", strike, atm_strike)
+
+        # Premium cap — validated edge lives in cheap entries; expensive premium has none
+        if not entry_premium_ok(premium, self.sc.max_entry_premium):
+            logger.info("SKIP %s: premium Rs.%.1f above cap Rs.%.0f", direction, premium, self.sc.max_entry_premium)
+            tag = f"[{self._label}] " if self._label else ""
+            send_telegram(f"{tag}SKIP {direction}: premium Rs.{premium:.1f} above cap Rs.{self.sc.max_entry_premium:.0f}")
+            return
 
         # Live: place real order
         if self.live:
@@ -538,6 +546,41 @@ class Trader:
         last_row = self._last_df.iloc[-1] if self._last_df is not None and not self._last_df.empty else None
         logger.info("Force-exit at %s: %s %s", reason, self.open_trade["dir"], self.open_trade.get("symbol"))
         self._process_exit(reason, last_row)
+
+    def _handle_eod(self) -> None:
+        """End-of-day carry decision per sc.eod_rule.
+
+        exit_all    -> always square off (intraday behaviour, the default)
+        exit_losers -> carry positions that are in profit, square off the rest;
+                       unknown LTP closes for safety. Carried positions are
+                       already persisted and restored next session via recovery.
+        """
+        if self.open_trade is None:
+            return
+
+        in_profit = None
+        ltp = None
+        if self._tick_manager:
+            ltp = self._tick_manager.get_ltp(self.open_trade["token"])
+        if ltp is None:
+            ltp = broker.fetch_ltp(self.ic.nfo_exchange, self.open_trade["symbol"], self.open_trade["token"])
+        if ltp is not None and self.open_trade["entry_price"]:
+            in_profit = ltp > self.open_trade["entry_price"]
+
+        if eod_exit_due(self.sc.eod_rule, in_profit):
+            self._force_exit_position("time_exit")
+            return
+
+        tag = f"[{self._label}] " if self._label else ""
+        pnl = (ltp - self.open_trade["entry_price"]) * self.open_trade["quantity"] if ltp else 0
+        logger.info("EOD: carrying winner overnight — %s %s (unrealized Rs.%.0f)",
+                    self.open_trade["dir"], self.open_trade.get("symbol"), pnl)
+        send_telegram(
+            f"{tag}CARRYING overnight (in profit)\n"
+            f"{self.open_trade['dir']} {self.open_trade.get('symbol')}\n"
+            f"Entry: Rs.{self.open_trade['entry_price']:.1f} → Now: Rs.{(ltp or 0):.1f}\n"
+            f"Unrealized: Rs.{pnl:,.0f}"
+        )
 
     # ------------------------------------------------------------------
     # Recovery from previous session

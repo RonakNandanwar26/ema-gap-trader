@@ -381,6 +381,22 @@ with st.sidebar:
         help="Exit when ema_gap_pct drops below this floor after 2+ candles held. 0 disables. "
              "Default reads EMA_GAP_FLOOR env var.",
     )
+    max_entry_premium_in = st.number_input(
+        "Max Entry Premium (Rs.)",
+        min_value=0.0, max_value=1000.0,
+        value=float(os.getenv("MAX_ENTRY_PREMIUM", "0")),
+        step=10.0, format="%.0f",
+        help="Skip entries whose option premium exceeds this — the validated edge lives in cheap entries "
+             "(backtest: <=100 doubles PF, all profit). 0 disables. Default reads MAX_ENTRY_PREMIUM env var.",
+    )
+    _eod_options = ["exit_all", "exit_losers"]
+    _eod_env = os.getenv("EOD_RULE", "exit_all")
+    eod_rule = st.selectbox(
+        "EOD Rule (15:10)", _eod_options,
+        index=_eod_options.index(_eod_env) if _eod_env in _eod_options else 0,
+        help="exit_all = flat by close (intraday). exit_losers = sleep mode: close losing positions, "
+             "carry winners overnight. Default reads EOD_RULE env var.",
+    )
     variant_gap_floor = st.number_input(
         "A/B variant EMA Gap Floor %",
         min_value=0.0, max_value=1.0,
@@ -416,7 +432,9 @@ sc = StrategyConfig(extra_entry_mode=extra_mode, ema_gap_min=gap_min,
                     candle_interval=candle_interval,
                     max_capital_per_trade_pct=max_capital_pct / 100,
                     orb_filter=orb_filter,
-                    ema_gap_floor=ema_gap_floor)
+                    ema_gap_floor=ema_gap_floor,
+                    max_entry_premium=max_entry_premium_in if max_entry_premium_in > 0 else None,
+                    eod_rule=eod_rule)
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,8 @@ class StrategyConfig:
     st_period: int = 10          # SuperTrend ATR period
     st_multiplier: float = 3.0   # SuperTrend multiplier
     orb_window_minutes: int = 30  # ORB range window from 9:15 (default 30 = 9:45)
+    max_entry_premium: float | None = None  # skip entries costing more than this; None disables
+    eod_rule: str = "exit_all"   # at 15:10: "exit_all" (intraday) | "exit_losers" (carry winners)
 
 
 @dataclass
@@ -92,6 +94,8 @@ def get_strategy_config() -> StrategyConfig:
         max_capital_per_trade_pct=float(os.getenv("MAX_CAPITAL_PER_TRADE_PCT", "0.25")),
         orb_filter=os.getenv("ORB_FILTER", "true").lower() == "true",
         ema_gap_floor=float(os.getenv("EMA_GAP_FLOOR", "0")),
+        max_entry_premium=float(os.environ["MAX_ENTRY_PREMIUM"]) if os.getenv("MAX_ENTRY_PREMIUM") else None,
+        eod_rule=os.getenv("EOD_RULE", "exit_all"),
     )
 
 

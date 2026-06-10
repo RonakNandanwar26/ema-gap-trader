@@ -852,3 +852,122 @@ class TestIntradayForceExit:
 
         # The complementary assertion: check_entry IS called when now < 14:55
         mock_check_entry.assert_called()
+
+
+# ===========================================================================
+# TestPremiumCapEntry
+# ===========================================================================
+
+class TestPremiumCapEntry:
+    """Entry premium cap (max_entry_premium) — the edge lives in cheap entries."""
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_entry_skipped_when_premium_above_cap(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, max_entry_premium=100.0)
+        mock_broker.resolve_option.return_value = ("NIFTY02JAN24C21500", "12345")
+        mock_broker.fetch_ltp.return_value = 150.0  # affordable but above cap
+
+        t = _make_trader(sc, sample_instrument_config)
+        t._scrip_master = {}
+        t._current_expiry = date(2024, 1, 4)
+        t._process_entry("CE", _make_row(), date(2024, 1, 2), candle_num=5)
+
+        assert t.open_trade is None
+        assert mock_tg.called  # skip notification sent
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_entry_allowed_at_cap(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, max_entry_premium=100.0)
+        mock_broker.resolve_option.return_value = ("NIFTY02JAN24C21500", "12345")
+        mock_broker.fetch_ltp.return_value = 100.0
+
+        t = _make_trader(sc, sample_instrument_config)
+        t._scrip_master = {}
+        t._current_expiry = date(2024, 1, 4)
+        t._process_entry("CE", _make_row(), date(2024, 1, 2), candle_num=5)
+
+        assert t.open_trade is not None
+        assert t.open_trade["entry_price"] == 100.0
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_cap_disabled_allows_expensive_entry(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        mock_broker.resolve_option.return_value = ("NIFTY02JAN24C21500", "12345")
+        mock_broker.fetch_ltp.return_value = 150.0  # within budget, no cap set
+
+        t = _make_trader(sample_strategy_config, sample_instrument_config)
+        t._scrip_master = {}
+        t._current_expiry = date(2024, 1, 4)
+        t._process_entry("CE", _make_row(), date(2024, 1, 2), candle_num=5)
+
+        assert t.open_trade is not None
+
+
+# ===========================================================================
+# TestEodSleepMode
+# ===========================================================================
+
+class TestEodSleepMode:
+    """End-of-day carry decision (_handle_eod) — sleep mode carries winners only."""
+
+    def _trader_with_open(self, sc, ic, entry_price=100.0):
+        t = _make_trader(sc, ic)
+        t.open_trade = _make_open_trade(entry_price=entry_price)
+        return t
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_exit_losers_closes_losing_position(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, eod_rule="exit_losers")
+        mock_broker.fetch_ltp.return_value = 80.0  # below entry 100 -> loser
+        t = self._trader_with_open(sc, sample_instrument_config)
+        t._handle_eod()
+        assert t.open_trade is None
+        assert len(t.trades) == 1
+        assert t.trades[0]["reason"] == "time_exit"
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_exit_losers_carries_winning_position(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, eod_rule="exit_losers")
+        mock_broker.fetch_ltp.return_value = 130.0  # above entry 100 -> winner
+        t = self._trader_with_open(sc, sample_instrument_config)
+        t._handle_eod()
+        assert t.open_trade is not None  # carried overnight
+        assert len(t.trades) == 0
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_exit_all_closes_winner_too(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, eod_rule="exit_all")
+        mock_broker.fetch_ltp.return_value = 130.0
+        t = self._trader_with_open(sc, sample_instrument_config)
+        t._handle_eod()
+        assert t.open_trade is None
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_exit_losers_unknown_ltp_closes_for_safety(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, eod_rule="exit_losers")
+        mock_broker.fetch_ltp.return_value = None
+        t = self._trader_with_open(sc, sample_instrument_config)
+        t._handle_eod()
+        assert t.open_trade is None
+
+    @patch("trader.send_telegram")
+    @patch("trader.broker")
+    def test_noop_when_no_position(self, mock_broker, mock_tg, sample_strategy_config, sample_instrument_config):
+        import dataclasses
+        sc = dataclasses.replace(sample_strategy_config, eod_rule="exit_losers")
+        t = _make_trader(sc, sample_instrument_config)
+        t._handle_eod()
+        assert t.open_trade is None
+        assert len(t.trades) == 0

@@ -148,3 +148,25 @@ class TestInstruments:
             assert actual_fields == required_fields, (
                 f"{name} missing fields: {required_fields - actual_fields}"
             )
+
+
+class TestSleepModeConfig:
+    def test_defaults_preserve_current_behaviour(self):
+        import os
+        from unittest.mock import patch as _patch
+        from config import get_strategy_config
+        with _patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAX_ENTRY_PREMIUM", None)
+            os.environ.pop("EOD_RULE", None)
+            sc = get_strategy_config()
+        assert sc.max_entry_premium is None
+        assert sc.eod_rule == "exit_all"
+
+    def test_from_env(self):
+        import os
+        from unittest.mock import patch as _patch
+        from config import get_strategy_config
+        with _patch.dict(os.environ, {"MAX_ENTRY_PREMIUM": "100", "EOD_RULE": "exit_losers"}):
+            sc = get_strategy_config()
+        assert sc.max_entry_premium == 100.0
+        assert sc.eod_rule == "exit_losers"
