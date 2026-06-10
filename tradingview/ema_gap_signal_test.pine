@@ -1,0 +1,179 @@
+//@version=6
+// EMA Gap Signal Test — directional-edge validation of ema-gap-trader's entry signal.
+//
+// Faithful port of strategy.py + indicators.py, traded on the INDEX (long for CE,
+// short for PE) instead of options. This tests ONLY whether the entry signal
+// predicts direction — it cannot test option P&L (theta, IV, spreads).
+//
+// Matched to the Python implementation:
+//   - RSI uses simple rolling means of gains/losses (NOT Wilder/RMA like ta.rsi)
+//   - SuperTrend ATR is an SMA of true range (NOT RMA like ta.supertrend)
+//   - Fills at signal-candle close (process_orders_on_close), same as backtester.py
+//   - ORB window replicates backtester quirk: bars with start time <= 9:(15+window)
+//     are part of the range (30-min window actually spans 9:15-10:00 of bar data),
+//     first eligible entry bar starts strictly after the window end.
+//
+// Apply to NSE:NIFTY, 15-minute chart.
+
+strategy("EMA Gap Signal Test", overlay = true,
+     process_orders_on_close = true,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     initial_capital = 100000,
+     max_bars_back = 500)
+
+// ─── Inputs (defaults = production .env config) ───
+emaShortLen  = input.int(9,    "EMA short span")
+emaLongLen   = input.int(21,   "EMA long span")
+stPeriod     = input.int(10,   "SuperTrend ATR period")
+stMult       = input.float(3.0,"SuperTrend multiplier")
+rsiLen       = input.int(14,   "RSI length")
+gapMin       = input.float(0.03, "EMA gap min %", step = 0.01)
+gapMax       = input.float(0.50, "EMA gap max %", step = 0.05)
+extraMode    = input.string("midtrend", "Extra entry mode", options = ["none", "midtrend", "expanding"])
+cooldownBars = input.int(3,    "Cooldown bars (extra-mode re-entry)")
+maxHold      = input.int(20,   "Max hold (bars)")
+useSignalExits = input.bool(true, "Signal exits (ST flip / EMA cross). OFF = max-hold only")
+orbEnabled   = input.bool(true, "ORB filter")
+orbWindowMin = input.int(30,   "ORB window (minutes from 9:15)")
+intradayOnly = input.bool(true, "Intraday only (no entry >= 14:55, force exit >= 15:10)")
+startDate    = input.time(timestamp("2023-04-01T00:00:00+05:30"), "Backtest start")
+endDate      = input.time(timestamp("2026-03-28T23:59:59+05:30"), "Backtest end")
+
+inDateRange = time >= startDate and time <= endDate
+
+// ─── Indicators (port of indicators.py) ───
+ema9   = ta.ema(close, emaShortLen)
+ema21  = ta.ema(close, emaLongLen)
+gapPct = math.abs(ema9 - ema21) / ema21 * 100
+gapExpanding = gapPct > gapPct[1]
+
+// SMA-based RSI: rolling mean of gains/losses (indicators.py lines 99-105)
+chg   = ta.change(close)
+gainS = ta.sma(math.max(chg, 0), rsiLen)
+lossS = ta.sma(math.max(-chg, 0), rsiLen)
+// loss==0 & gain>0 -> 100 ; both 0 -> 50 (Python fillna(50)) ; warmup -> na
+rsiVal = na(gainS) ? na : lossS == 0 ? (gainS == 0 ? 50.0 : 100.0) : 100 - 100 / (1 + gainS / lossS)
+
+// SuperTrend with SMA ATR (port of compute_supertrend)
+atrSma = ta.sma(ta.tr(true), stPeriod)
+basicUpper = hl2 + stMult * atrSma
+basicLower = hl2 - stMult * atrSma
+var float finalUpper = na
+var float finalLower = na
+var int   stDir      = 0   // 0 = warmup (blocks entries, like Python st_dir=0)
+if not na(atrSma)
+    if stDir == 0
+        finalUpper := basicUpper
+        finalLower := basicLower
+        stDir      := -1
+    else
+        finalLower := basicLower > finalLower[1] or close[1] < finalLower[1] ? basicLower : finalLower[1]
+        finalUpper := basicUpper < finalUpper[1] or close[1] > finalUpper[1] ? basicUpper : finalUpper[1]
+        if stDir[1] == 1
+            stDir := close < finalLower ? -1 : 1
+        else
+            stDir := close > finalUpper ? 1 : -1
+
+// ─── Session clock (exchange timezone) ───
+barMin    = hour(time, syminfo.timezone) * 60 + minute(time, syminfo.timezone)
+orbEndMin = 9 * 60 + math.min(15 + orbWindowMin, 59)   // replicates _t(9, min(15+w, 59))
+openMin   = 9 * 60 + 15
+noEntryMin = 14 * 60 + 55
+timeExitMin = 15 * 60 + 10
+
+// ─── ORB range per day ───
+var float orbHigh  = na
+var float orbLow   = na
+var int   orbCount = 0
+newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+if newDay
+    orbHigh  := na
+    orbLow   := na
+    orbCount := 0
+if barMin >= openMin and barMin <= orbEndMin
+    orbHigh  := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow   := na(orbLow) ? low : math.min(orbLow, low)
+    orbCount += 1
+orbReady = orbCount >= 2 and barMin > orbEndMin   // >=2 bars, entries strictly after window
+
+// ─── Position state (tracked manually; fills happen at this bar's close) ───
+var int    entryBar    = na
+var int    lastExitBar = na
+var string posDir      = ""
+
+// ─── EXIT (checked before entry, same order as backtester.py) ───
+if posDir != ""
+    held = bar_index - entryBar
+    exitReason = ""
+    if useSignalExits
+        if (posDir == "CE" and stDir == -1) or (posDir == "PE" and stDir == 1)
+            exitReason := "ST_flip"
+        else if (posDir == "CE" and ema9 < ema21) or (posDir == "PE" and ema9 > ema21)
+            exitReason := "EMA_cross"
+    if exitReason == "" and held >= maxHold
+        exitReason := "max_hold"
+    if exitReason == "" and intradayOnly and barMin >= timeExitMin
+        exitReason := "time_exit"
+    if exitReason != ""
+        strategy.close_all(comment = exitReason)
+        posDir      := ""
+        lastExitBar := bar_index
+
+// ─── ENTRY (port of check_entry) ───
+canEnter = posDir == "" and inDateRange and barMin >= openMin and barMin < timeExitMin and
+           (not intradayOnly or barMin < noEntryMin)
+
+if canEnter
+    crossUp   = ema9[1] <= ema21[1] and ema9 > ema21
+    crossDown = ema9[1] >= ema21[1] and ema9 < ema21
+
+    dir = ""
+    // 1. Crossover (always active)
+    if crossUp and stDir == 1
+        dir := "CE"
+    else if crossDown and stDir == -1
+        dir := "PE"
+    // 2. Extra mode (only if no crossover fired)
+    else if extraMode != "none"
+        cooldownOk = na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+        if cooldownOk and (extraMode != "expanding" or gapExpanding)
+            if ema9 > ema21 and stDir == 1
+                dir := "CE"
+            else if ema9 < ema21 and stDir == -1
+                dir := "PE"
+
+    // 3. Common filters
+    if dir == "CE" and (na(rsiVal) or rsiVal <= 50)
+        dir := ""
+    if dir == "PE" and (na(rsiVal) or rsiVal >= 50)
+        dir := ""
+    if dir != "" and gapMin > 0 and gapPct < gapMin
+        dir := ""
+    if dir != "" and gapPct > gapMax
+        dir := ""
+    if dir != "" and orbEnabled
+        if not orbReady
+            dir := ""
+        else if dir == "CE" and close < orbHigh
+            dir := ""
+        else if dir == "PE" and close > orbLow
+            dir := ""
+
+    if dir == "CE"
+        strategy.entry("CE", strategy.long)
+        posDir   := "CE"
+        entryBar := bar_index
+    else if dir == "PE"
+        strategy.entry("PE", strategy.short)
+        posDir   := "PE"
+        entryBar := bar_index
+
+// ─── Plots ───
+plot(ema9,  "EMA short", color = color.new(color.aqua, 0))
+plot(ema21, "EMA long",  color = color.new(color.orange, 0))
+plot(stDir == 1 ? finalLower : finalUpper, "SuperTrend",
+     color = stDir == 1 ? color.new(color.green, 30) : color.new(color.red, 30),
+     style = plot.style_linebr)
+plot(orbEnabled and barMin > orbEndMin ? orbHigh : na, "ORB high", color = color.new(color.gray, 50), style = plot.style_linebr)
+plot(orbEnabled and barMin > orbEndMin ? orbLow : na, "ORB low",  color = color.new(color.gray, 50), style = plot.style_linebr)

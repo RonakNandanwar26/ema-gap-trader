@@ -80,6 +80,44 @@ def check_entry(
     return direction
 
 
+def entry_premium_ok(premium: float | None, max_premium: float | None) -> bool:
+    """Premium-level entry filter: the edge lives in cheap option entries.
+
+    max_premium=None disables the filter. With it set, unknown premium blocks
+    entry (can't verify affordability -> stay out).
+    """
+    if max_premium is None:
+        return True
+    return premium is not None and premium <= max_premium
+
+
+def eod_exit_due(eod_rule: str | None, in_profit: bool | None) -> bool:
+    """End-of-day (15:10) carry decision.
+
+    None         -> hold everything overnight (full carry-forward)
+    "exit_all"   -> flat by close (intraday only)
+    "exit_losers"-> carry winners, close losers; unknown P&L closes for safety
+    """
+    if eod_rule is None:
+        return False
+    if eod_rule == "exit_all":
+        return True
+    return in_profit is not True  # exit_losers
+
+
+def check_stop_loss(prem_in: float | None, prem_low: float | None,
+                    stop_loss_pct: float) -> float | None:
+    """Per-trade stop loss on option premium.
+
+    Returns the stop level (assumed fill price) if the candle low breached
+    entry_premium * (1 - pct/100), else None. pct=0 disables.
+    """
+    if not stop_loss_pct or prem_in is None or prem_low is None:
+        return None
+    threshold = prem_in * (1 - stop_loss_pct / 100)
+    return threshold if prem_low <= threshold else None
+
+
 def check_exit(
     row: pd.Series,
     trade_dir: str,

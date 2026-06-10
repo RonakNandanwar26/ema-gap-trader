@@ -276,3 +276,79 @@ class TestCheckExit:
         row = _make_row(st_dir=1, ema9=100, ema21=95, ema_gap_pct=0.01)
         assert check_exit(row, trade_dir="CE", candles_held=20, max_hold=20,
                           ema_gap_floor=0.05) == "gap_contract"
+
+
+# ---------------------------------------------------------------------------
+# Entry premium filter
+# ---------------------------------------------------------------------------
+class TestEntryPremiumOk:
+    def test_cheap_premium_allowed(self):
+        from strategy import entry_premium_ok
+        assert entry_premium_ok(45.0, max_premium=100.0) is True
+
+    def test_expensive_premium_blocked(self):
+        from strategy import entry_premium_ok
+        assert entry_premium_ok(180.0, max_premium=100.0) is False
+
+    def test_boundary_inclusive(self):
+        from strategy import entry_premium_ok
+        assert entry_premium_ok(100.0, max_premium=100.0) is True
+
+    def test_none_premium_blocked(self):
+        from strategy import entry_premium_ok
+        assert entry_premium_ok(None, max_premium=100.0) is False
+
+    def test_filter_disabled_allows_all(self):
+        from strategy import entry_premium_ok
+        assert entry_premium_ok(500.0, max_premium=None) is True
+        assert entry_premium_ok(None, max_premium=None) is True
+
+
+# ---------------------------------------------------------------------------
+# Per-trade stop loss
+# ---------------------------------------------------------------------------
+class TestCheckStopLoss:
+    def test_triggers_when_low_breaches_threshold(self):
+        from strategy import check_stop_loss
+        # entry 100, SL 20% -> threshold 80; low 75 breaches -> exit at 80
+        assert check_stop_loss(100.0, 75.0, 20.0) == 80.0
+
+    def test_no_trigger_when_low_above_threshold(self):
+        from strategy import check_stop_loss
+        assert check_stop_loss(100.0, 85.0, 20.0) is None
+
+    def test_exact_threshold_triggers(self):
+        from strategy import check_stop_loss
+        assert check_stop_loss(100.0, 80.0, 20.0) == 80.0
+
+    def test_disabled_when_pct_zero(self):
+        from strategy import check_stop_loss
+        assert check_stop_loss(100.0, 1.0, 0.0) is None
+
+    def test_none_inputs_no_trigger(self):
+        from strategy import check_stop_loss
+        assert check_stop_loss(None, 75.0, 20.0) is None
+        assert check_stop_loss(100.0, None, 20.0) is None
+
+
+# ---------------------------------------------------------------------------
+# End-of-day rule
+# ---------------------------------------------------------------------------
+class TestEodExitDecision:
+    def test_exit_all_closes_winner_and_loser(self):
+        from strategy import eod_exit_due
+        assert eod_exit_due("exit_all", in_profit=True) is True
+        assert eod_exit_due("exit_all", in_profit=False) is True
+
+    def test_exit_losers_holds_winner(self):
+        from strategy import eod_exit_due
+        assert eod_exit_due("exit_losers", in_profit=True) is False
+        assert eod_exit_due("exit_losers", in_profit=False) is True
+
+    def test_carry_rule_none_holds_everything(self):
+        from strategy import eod_exit_due
+        assert eod_exit_due(None, in_profit=False) is False
+
+    def test_unknown_profit_state_exits_for_safety(self):
+        from strategy import eod_exit_due
+        assert eod_exit_due("exit_losers", in_profit=None) is True
